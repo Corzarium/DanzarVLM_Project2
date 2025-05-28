@@ -1,0 +1,134 @@
+# Game Profile: Everquest
+
+# This profile defines settings, prompts, and overrides specifically for Everquest.
+# It instructs the VLM on what visual information to focus on and how to generate commentary and advice.
+
+general:
+  game_name: "Everquest"
+  # Add any general settings specific to Everquest here
+  # Example: capture_region: "main_game_window" # (This is conceptual, implementation might vary)
+
+vlm_settings:
+  # Model settings for the VLM. Can override global settings if needed.
+  vlm_model: "gemini-pro-vision" # Using gemini-pro-vision as a placeholder VLM
+  vlm_max_tokens: 1500 # Adjusted default max tokens for potentially more detailed commentary
+  vlm_temperature: 0.9 # Using a more standard temperature
+  vlm_max_commentary_sentences: 5 # Limit sentence count for brevity
+
+prompts:
+  # General system prompt (can be overridden by system_prompt_commentary or system_prompt_chat)
+  system_prompt: |
+    You are DanzarVLM, an AI commentator and advisor for Everquest gameplay.
+    Your role is to observe the game screen, understand the current situation,
+    and provide helpful, timely commentary and advice to the player.
+    Focus on key information like party health and mana, the target's health,
+    and the main action happening in the game world.
+    Offer strategic suggestions, point out important events, and provide context
+    based on the game state. Be concise and directly relevant to the visual information.
+
+  # System prompt specifically for VLM commentary based on image analysis
+  system_prompt_commentary: |
+    You are DanzarVLM, an AI commentator for Everquest observing the player's screen.
+    Your task is to analyze the provided screenshot and generate brief, insightful commentary or advice
+    based on the current game state. Pay close attention to the health and mana bars of the party,
+    the target's health, and the main activity in the game world (combat, exploration, etc.).
+    Highlight critical situations (e.g., low health/mana), suggest actions, or point out noteworthy events.
+    Keep your commentary concise and focused.
+
+  # Template for the user message sent to the VLM, including image and OCR context
+  user_prompt_template_commentary: |
+    Analyze this image from Everquest.
+    Focus on the following key areas: party member health and mana, the target's health, and the main game view.
+    If available, consider the visible text (OCR) for additional context.
+
+    Visible text on screen (OCR):
+    {ocr_text}
+
+    Generate 1-2 key observations or pieces of advice based on the current situation.
+
+  # Add other prompt sections as needed, e.g., for conversational chat
+  system_prompt_chat: |
+    You are DanzarVLM, a helpful AI assistant for Everquest. Respond to user queries
+    based on your knowledge from game information and conversation history.
+    If you don't know the answer based on the provided context, indicate that you are
+    searching for more information or don't have the answer.
+
+  conversational_max_tokens: 1400 # Limit tokens for chat responses
+  conversational_temperature: 0.7 # Standard temperature for chat
+
+  # Specific prompts or instructions related to analyzing visual elements.
+  # These could be part of the main system prompt or used in specific VLM calls
+  # depending on the implementation in llm_service.py. Kept for reference,
+  # but the template above is the primary method for commentary.
+  visual_analysis_instructions: |
+    Analyze the provided game screenshot. Pay close attention to:
+    - The health bars of the player and party members. Report critical health levels.
+    - The mana bars of the player and party members. Comment on mana levels, especially for casters.
+    - The health bar of the currently targeted enemy or NPC.
+    - The main area of the screen to understand combat, movement, or interaction.
+    Based on these observations, generate commentary and suggest actions or strategies.
+
+
+# --- OCR Settings ---
+ocr_settings:
+  engine: "easyocr" # Assuming EasyOCR is the default/preferred engine
+  easyocr_languages: ['en'] # Default to English
+  easyocr_gpu: true # Default to using GPU if available
+  default_upscale_factor: 2.0 # Upscale for better OCR accuracy on smaller text
+  default_grayscale: true
+  default_binarize: true
+  default_binarize_method: "otsu"
+  default_confidence_threshold: 0.25 # Confidence threshold for OCR results
+
+# Path to JSON file defining OCR Regions of Interest (ROIs) for Everquest UI
+# You will need to create this file based on the Everquest UI layout.
+ocr_layout_path: "config/ui_layouts/everquest_ocr_layout.json"
+
+# RAG for game knowledge
+# This is the name of the collection where you ingested Everquest wiki data.
+# **IMPORTANT: Replace "everquest_wiki_data" with the actual name of your RAG collection.**
+rag_collection_name: "multimodal_rag_default"
+rag_top_k: 5 # Number of top RAG results to retrieve
+
+# Reference image (optional) - Path to a screenshot showing the Everquest UI layout
+# Useful for VLM to understand the layout and locations of UI elements.
+reference_image_path: "config/ui_layouts/everquest_reference.png"
+
+# Regions of interest for VLM visual hints (optional, requires VLM support)
+# Define specific areas of the screen the VLM should analyze with specific instructions.
+# These are examples; you'll need to define actual regions based on the Everquest UI.
+regions_of_interest:
+  - name: "Party Status"
+    location_description: "the area showing health and mana bars for the player and party members"
+    vlm_instruction: "Analyze the health and mana levels of all party members. Report any critically low levels and suggest appropriate actions (healing, resting, mana regeneration)."
+  - name: "Target Status"
+    location_description: "the area displaying the health bar and status of the currently targeted enemy or NPC"
+    vlm_instruction: "Examine the target's health bar. Estimate remaining health and comment on its status if discernible."
+  - name: "Main Game View"
+    location_description: "the central part of the screen showing the character, environment, and action"
+    vlm_instruction: "Describe the main activity happening in this area (combat, movement, interaction, environment). Note enemy types or important visual cues."
+  # Add more regions as needed, e.g., for buffs/debuffs, chat window, etc.
+
+
+# --- Short-Term Memory Settings ---
+# Size of the in-memory deque for recent interactions
+memory_deque_size: 10 # Increased default for more chat context
+
+# RAG collection for chat history (optional, if you want to RAG user/bot turns)
+# **IMPORTANT: Replace with your actual history collection name if you use one.**
+# If you don't have a separate history RAG, you might not need this or rag_collection_name could serve double duty.
+memory_rag_history_collection_name: "danzarvlm_everquest_history" # Example history collection name
+
+# Number of relevant VLM commentary memories to include in chat context (if using history RAG)
+memory_rag_vlm_commentary_lookback_k: 2
+
+# Number of relevant chat turn memories (user/bot) to include in chat context (if using history RAG)
+memory_rag_chat_lookback_k: 5 # Increased default for more chat context
+
+
+# Add any other Everquest-specific overrides or settings here
+# For example, specific keywords to listen for or UI element locations if needed for analysis.
+# overrides:
+#   ui_elements:
+#     party_member_health_region: [x1, y1, x2, y2] # Conceptual - requires image processing
+#     target_health_region: [x1, y1, x2, y2] 

@@ -1,0 +1,115 @@
+/* Chat Interface */
+.chat-messages {
+    height: 400px;
+    overflow-y: auto;
+    border: 1px solid #dee2e6;
+    border-radius: 0.25rem;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    background-color: #f8f9fa;
+}
+
+.message {
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    border-radius: 0.5rem;
+    max-width: 80%;
+    word-wrap: break-word;
+}
+
+.message.user {
+    background-color: #e9ecef;
+    margin-left: auto;
+    text-align: right;
+}
+
+.message.bot {
+    background-color: #d2e3fc;
+}
+
+.message.system {
+    background-color: #fff3cd;
+    max-width: 100%;
+    border: 1px solid #ffeeba;
+    font-style: italic;
+}
+
+.card {
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+}
+
+.form-control:focus {
+    border-color: #80bdff;
+    box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
+}
+
+/* Prompt Displays */
+.prompt-display {
+    white-space: pre-wrap;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.prompt-textarea {
+    font-family: monospace;
+}
+
+/* Status styling */
+.status-indicator {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 0.5rem;
+}
+
+.status-indicator.enabled {
+    background-color: #28a745;
+}
+
+.status-indicator.disabled {
+    background-color: #dc3545;
+}
+
+/* Diagnostic Button */
+#runDiagnosticBtn {
+    font-weight: bold;
+}
+
+/* Utility Classes */
+.text-sm {
+    font-size: 0.875rem;
+}
+
+/* Custom Alert for Diagnostic Output */
+.alert-diagnostic {
+    background-color: #fff3cd;
+    border-color: #ffeeba;
+    color: #856404;
+}
+
+/* Image Format Information */
+.format-badge {
+    display: inline-block;
+    padding: 0.25rem 0.5rem;
+    background-color: #e9ecef;
+    border-radius: 0.25rem;
+    margin: 0.25rem;
+    font-size: 0.875rem;
+}
+
+.format-badge.active {
+    background-color: #28a745;
+    color: white;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .chat-messages {
+        height: 250px;
+    }
+    
+    .message {
+        max-width: 90%;
+    }
+} 

@@ -1,0 +1,23 @@
+{
+  "Resources_TopLeft": {
+    "coords": [5, 30, 100, 700], 
+    "upscale_factor": 2.0, 
+    "confidence_threshold": 0.5
+  },
+  "Colonists_TopRight": {
+    "coords": [1370, 90, 220, 200], 
+    "upscale_factor": 2.5,
+    "binarize_method": "adaptive",
+    "confidence_threshold": 0.3
+  },
+  "Alerts_BottomRight": {
+    "coords": [1500, 550, 200, 250], 
+    "upscale_factor": 2.5,
+    "confidence_threshold": 0.4
+  },
+  "CharacterInfo_BottomLeft": {
+    "coords": [5, 800, 700, 300], 
+    "upscale_factor": 1.5, 
+    "confidence_threshold": 0.3
+  }
+}

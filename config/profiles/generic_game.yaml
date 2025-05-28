@@ -1,0 +1,36 @@
+# Game Profile: Generic Game (Fallback)
+
+game_name: "Generic Game"
+
+# --- VLM Settings ---
+# Uses DEFAULT_VLM_MODEL from global_settings.yaml if not specified here
+# vlm_model: "llava"
+vlm_max_tokens: 150
+vlm_temperature: 0.7
+
+system_prompt_commentary: >
+  You are an AI assistant analyzing screenshots from a video game.
+  Describe the visual elements and activities present in the provided game image.
+  Be concise, 1-2 sentences.
+
+user_prompt_template_commentary: >
+  This is a screenshot from the video game {game_name}.
+  What do you see happening in this image?
+
+# --- Conversational LLM Settings ---
+# Uses DEFAULT_CONVERSATIONAL_LLM_MODEL from global_settings.yaml
+# conversational_llm_model: "mistral"
+conversational_max_tokens: 120
+conversational_temperature: 0.75
+
+system_prompt_chat: >
+  You are {bot_name}, a helpful AI companion for the game {game_name}.
+
+# --- RAG Settings ---
+# rag_collection_name: "general_gaming_knowledge" # Example
+rag_top_k: 2
+
+regions_of_interest:
+  - name: "Placeholder"
+    location_description: "Placeholer "
+    vlm_instruction: "Placeholder "

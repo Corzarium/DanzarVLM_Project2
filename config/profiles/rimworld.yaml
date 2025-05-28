@@ -1,0 +1,54 @@
+# config/profiles/rimworld.yaml
+game_name: "RimWorld"
+
+# VLM Settings
+vlm_model: "llava-hf/llava-1.5-7b-hf"
+system_prompt_commentary: |
+  You are an engaging and insightful RimWorld commentator...
+user_prompt_template_commentary: |
+  The game is {game_name}.
+  Visible text on screen (OCR):
+  {ocr_text}
+
+  Based on the image and the text, what are 1-2 key observations or pieces of advice for the player?
+vlm_max_tokens: 300
+vlm_temperature: 1.5 # This is very high, might lead to incoherent output. Typical is 0.7-1.0.
+vlm_max_commentary_sentences: 5
+
+# --- OCR Settings ---
+ocr_settings:
+  engine: "easyocr"
+  easyocr_languages: ['en']
+  easyocr_gpu: true
+  default_upscale_factor: 2.0 
+  default_grayscale: true
+  default_binarize: true
+  default_binarize_method: "otsu"
+  default_confidence_threshold: 0.25
+
+# Path to JSON file defining OCR ROIs
+ocr_layout_path: "config/ui_layouts/rimworld_ocr_layout.json" 
+
+# RAG for game knowledge
+rag_collection_name: "rimworld_wiki"
+rag_top_k: 3
+
+# Reference image (optional)
+reference_image_path: "config/ui_layouts/rimworld_reference.png"
+
+# Regions of interest for VLM visual hints
+regions_of_interest:
+  - name: "Alerts Panel"
+    location_description: "the list of alert icons and messages, typically found in the right side of the screen"
+    vlm_instruction: "Pay close attention to any active alerts in this area. Summarize what they indicate about the colony's situation. Note if there are many or few critical alerts."
+  - name: "Colonist Bar"
+    # ... other regions ...
+  - name: "Time and Date Controls"
+    location_description: "the area, usually at the bottom center or bottom right, showing the current game time, date, and speed controls"
+    vlm_instruction: "Briefly note the current in-game date and time, if discernible."
+
+# --- Short-Term Memory Settings --- # CORRECT INDENTATION
+memory_deque_size: 3
+memory_rag_history_collection_name: "danzarvlm_rimworld_history"
+memory_rag_vlm_commentary_lookback_k: 2
+memory_rag_chat_lookback_k: 4
