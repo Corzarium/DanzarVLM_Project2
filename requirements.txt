@@ -1,0 +1,60 @@
+# Core dependencies
+pyyaml==6.0.1
+numpy==1.26.4
+requests==2.32.3
+python-dotenv==1.1.0
+
+# AI/ML dependencies
+torch==2.1.2
+torchvision==0.16.2
+transformers==4.34.0
+huggingface-hub>=0.16.4,<0.18.0  # Compatible with tokenizers 0.14.1
+tokenizers==0.14.1
+accelerate==0.24.1
+safetensors==0.4.1
+sentencepiece==0.1.99
+sentence-transformers==2.7.0
+
+# Image processing
+opencv-python==4.8.1.78
+Pillow==10.1.0
+
+# Utilities
+tqdm==4.66.1
+scipy==1.11.4
+
+# Vector Database
+qdrant-client==1.7.0
+
+# NDI (Network Device Interface)
+ndi-python>=5.1.1.1
+
+# Audio Processing & Wake Word Detection
+openwakeword==0.5.1
+openai-whisper==20231117
+pydub==0.25.1
+
+# Discord Integration - Py-cord with Built-in Voice Recording
+py-cord[voice]>=2.6.0
+
+# Voice Activity Detection
+webrtcvad-wheels>=2.0.12
+
+# Speech-to-Text (offline whisper model) - already included above
+# TTS dependencies - using existing Chatterbox service
+
+# Ollama Python client for local LLM
+ollama>=0.1.7
+
+# Web Interface
+flask==2.3.3
+
+# Hotkey monitoring
+keyboard==0.13.5
+
+# Voice command dependencies
+webrtcvad==2.0.10
+numpy>=1.21.0
+py-cord>=2.6.0
+sounddevice>=0.4.5
+soundfile>=0.10.3

@@ -1,0 +1,26 @@
+{
+    "chat_window": {
+        "x": 0,
+        "y": 600,
+        "width": 400,
+        "height": 200,
+        "enabled": true,
+        "priority": 1
+    },
+    "target_window": {
+        "x": 10,
+        "y": 10,
+        "width": 200,
+        "height": 100,
+        "enabled": true,
+        "priority": 2
+    },
+    "exp_window": {
+        "x": 400,
+        "y": 0,
+        "width": 200,
+        "height": 50,
+        "enabled": true,
+        "priority": 3
+    }
+}

@@ -4,57 +4,64 @@
 # It instructs the VLM on what visual information to focus on and how to generate commentary and advice.
 
 general:
-  game_name: "Everquest"
+  game_name: "EverQuest"
   # Add any general settings specific to Everquest here
   # Example: capture_region: "main_game_window" # (This is conceptual, implementation might vary)
 
 vlm_settings:
   # Model settings for the VLM. Can override global settings if needed.
-  vlm_model: "gemini-pro-vision" # Using gemini-pro-vision as a placeholder VLM
-  vlm_max_tokens: 1500 # Adjusted default max tokens for potentially more detailed commentary
-  vlm_temperature: 0.9 # Using a more standard temperature
-  vlm_max_commentary_sentences: 5 # Limit sentence count for brevity
+  vlm_model: "deepseek-r1-0528-qwen3-8b"  # Upgraded to DeepSeek-R1 for enhanced reasoning
+  vlm_max_tokens: 4096  # Much higher for reasoning model
+  vlm_temperature: 0.3  # Lower for more focused reasoning
+  vlm_max_commentary_sentences: 5  # Allow more detailed responses
 
 prompts:
   # General system prompt (can be overridden by system_prompt_commentary or system_prompt_chat)
   system_prompt: |
-    You are DanzarVLM, an AI commentator and advisor for Everquest gameplay.
-    Your role is to observe the game screen, understand the current situation,
-    and provide helpful, timely commentary and advice to the player.
-    Focus on key information like party health and mana, the target's health,
-    and the main action happening in the game world.
-    Offer strategic suggestions, point out important events, and provide context
-    based on the game state. Be concise and directly relevant to the visual information.
+    You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). 
+    Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. 
+    When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. 
+    Use gamer lingo naturally, but explain anything arcane so newcomers feel included. 
+    Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.
 
   # System prompt specifically for VLM commentary based on image analysis
   system_prompt_commentary: |
-    You are DanzarVLM, an AI commentator for Everquest observing the player's screen.
-    Your task is to analyze the provided screenshot and generate brief, insightful commentary or advice
-    based on the current game state. Pay close attention to the health and mana bars of the party,
-    the target's health, and the main activity in the game world (combat, exploration, etc.).
-    Highlight critical situations (e.g., low health/mana), suggest actions, or point out noteworthy events.
-    Keep your commentary concise and focused.
+    You are Danzar, an upbeat and witty EverQuest raid leader with deep knowledge of classic EverQuest mechanics, classes, zones, and gameplay. 
+    
+    You provide helpful, accurate commentary about what's happening on screen with the energy of a friendly guild leader. You understand:
+    - All 14 EverQuest classes: Warrior, Cleric, Paladin, Ranger, Shadow Knight, Monk, Bard, Rogue, Wizard, Magician, Necromancer, Enchanter, Druid, Shaman
+    - Combat mechanics: auto-attack, spell casting, meditation, skill training
+    - Zone knowledge: newbie areas, dungeons, raid zones, faction areas
+    - Death penalties: experience loss, corpse retrieval, binding locations
+    - Group dynamics: tanking, healing, crowd control, DPS roles
+    - Economic systems: tradeskills, buying/selling, bartering
+    
+    Keep responses concise (1-2 sentences) but enthusiastic and encouraging. Use gamer lingo naturally but explain anything complex. 
+    Focus on actionable advice with that "let's crush this dungeon together" energy!
 
   # Template for the user message sent to the VLM, including image and OCR context
   user_prompt_template_commentary: |
-    Analyze this image from Everquest.
-    Focus on the following key areas: party member health and mana, the target's health, and the main game view.
-    If available, consider the visible text (OCR) for additional context.
-
+    The game is {game_name}.
     Visible text on screen (OCR):
     {ocr_text}
 
-    Generate 1-2 key observations or pieces of advice based on the current situation.
+    Based on the image and text, provide 1-2 key observations about the current EverQuest gameplay situation with your signature upbeat energy. 
+    Focus on: character status, combat situation, location/zone, group dynamics, or strategic advice.
+    Speak like a friendly raid leader cheering on the team!
 
   # Add other prompt sections as needed, e.g., for conversational chat
   system_prompt_chat: |
-    You are DanzarVLM, a helpful AI assistant for Everquest. Respond to user queries
-    based on your knowledge from game information and conversation history.
-    If you don't know the answer based on the provided context, indicate that you are
-    searching for more information or don't have the answer.
+    You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). 
+    Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. 
+    When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. 
+    Use gamer lingo naturally, but explain anything arcane so newcomers feel included. 
+    Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.
+    
+    If you don't know the answer based on the provided context, stay positive and let them know you're searching for more information!
 
-  conversational_max_tokens: 1400 # Limit tokens for chat responses
-  conversational_temperature: 0.7 # Standard temperature for chat
+  conversational_max_tokens: 16384  # Maximum for DeepSeek-R1 reasoning model's full output
+  conversational_temperature: 0.4  # Lower temperature for more focused reasoning
+  conversational_llm_model: "deepseek-r1-0528-qwen3-8b"  # Explicitly set the reasoning model
 
   # Specific prompts or instructions related to analyzing visual elements.
   # These could be part of the main system prompt or used in specific VLM calls
@@ -71,59 +78,69 @@ prompts:
 
 # --- OCR Settings ---
 ocr_settings:
-  engine: "easyocr" # Assuming EasyOCR is the default/preferred engine
-  easyocr_languages: ['en'] # Default to English
-  easyocr_gpu: true # Default to using GPU if available
-  default_upscale_factor: 2.0 # Upscale for better OCR accuracy on smaller text
+  engine: "easyocr"
+  easyocr_languages: ['en']
+  easyocr_gpu: true
+  default_upscale_factor: 2.0 
   default_grayscale: true
   default_binarize: true
   default_binarize_method: "otsu"
-  default_confidence_threshold: 0.25 # Confidence threshold for OCR results
+  default_confidence_threshold: 0.3  # Slightly higher for EQ's UI text
 
-# Path to JSON file defining OCR Regions of Interest (ROIs) for Everquest UI
-# You will need to create this file based on the Everquest UI layout.
+# Path to JSON file defining EverQuest-specific OCR regions
 ocr_layout_path: "config/ui_layouts/everquest_ocr_layout.json"
 
-# RAG for game knowledge
-# This is the name of the collection where you ingested Everquest wiki data.
-# **IMPORTANT: Replace "everquest_wiki_data" with the actual name of your RAG collection.**
-rag_collection_name: "multimodal_rag_default"
-rag_top_k: 5 # Number of top RAG results to retrieve
+# RAG for EverQuest knowledge (contains our populated knowledge base)
+rag_collection_name: "Everquest"
+rag_top_k: 3
 
-# Reference image (optional) - Path to a screenshot showing the Everquest UI layout
-# Useful for VLM to understand the layout and locations of UI elements.
+# Reference image for EverQuest UI (optional)
 reference_image_path: "config/ui_layouts/everquest_reference.png"
 
-# Regions of interest for VLM visual hints (optional, requires VLM support)
-# Define specific areas of the screen the VLM should analyze with specific instructions.
-# These are examples; you'll need to define actual regions based on the Everquest UI.
+# Regions of interest for EverQuest VLM analysis
 regions_of_interest:
-  - name: "Party Status"
-    location_description: "the area showing health and mana bars for the player and party members"
-    vlm_instruction: "Analyze the health and mana levels of all party members. Report any critically low levels and suggest appropriate actions (healing, resting, mana regeneration)."
-  - name: "Target Status"
-    location_description: "the area displaying the health bar and status of the currently targeted enemy or NPC"
-    vlm_instruction: "Examine the target's health bar. Estimate remaining health and comment on its status if discernible."
-  - name: "Main Game View"
-    location_description: "the central part of the screen showing the character, environment, and action"
-    vlm_instruction: "Describe the main activity happening in this area (combat, movement, interaction, environment). Note enemy types or important visual cues."
-  # Add more regions as needed, e.g., for buffs/debuffs, chat window, etc.
-
+  - name: "Chat Window"
+    location_description: "the main chat area showing tells, says, guild chat, combat messages, and system notifications"
+    vlm_instruction: "Look for important combat messages, death notifications, spell fizzles, faction messages, or player communication that might need attention."
+  
+  - name: "Character Stats"
+    location_description: "the character window or stats display showing hit points, mana, stamina, and experience"
+    vlm_instruction: "Check character health and mana levels. Note if health/mana is critically low or if the character needs to meditate."
+  
+  - name: "Spell Gems"
+    location_description: "the 8 memorized spell slots showing currently prepared spells and their readiness"
+    vlm_instruction: "Identify which spells are memorized and ready to cast. Note if important spells are missing or on cooldown."
+  
+  - name: "Target Window"
+    location_description: "the target display showing the selected enemy or NPC with health bar and information"
+    vlm_instruction: "Assess the target's health, level, and combat status. Note if it's a dangerous enemy or if combat is going well."
+  
+  - name: "Group Window"
+    location_description: "the group member display showing party health, mana, and status"
+    vlm_instruction: "Monitor group member health and mana. Identify if anyone needs healing or is in danger."
+  
+  - name: "Inventory/Bags"
+    location_description: "character inventory slots and bag contents"
+    vlm_instruction: "Check for important items, food for stamina, reagents for spells, or if inventory is full."
+  
+  - name: "Zone Information"
+    location_description: "area showing current zone name, location, or environmental indicators"
+    vlm_instruction: "Identify the current zone and assess if it's appropriate for the character's level or if there are zone-specific dangers."
 
 # --- Short-Term Memory Settings ---
 # Size of the in-memory deque for recent interactions
-memory_deque_size: 10 # Increased default for more chat context
+memory_deque_size: 5  # Slightly larger for complex EQ interactions
 
 # RAG collection for chat history (optional, if you want to RAG user/bot turns)
 # **IMPORTANT: Replace with your actual history collection name if you use one.**
 # If you don't have a separate history RAG, you might not need this or rag_collection_name could serve double duty.
-memory_rag_history_collection_name: "danzarvlm_everquest_history" # Example history collection name
+memory_rag_history_collection_name: "danzarvlm_everquest_history"
 
 # Number of relevant VLM commentary memories to include in chat context (if using history RAG)
-memory_rag_vlm_commentary_lookback_k: 2
+memory_rag_vlm_commentary_lookback_k: 3
 
 # Number of relevant chat turn memories (user/bot) to include in chat context (if using history RAG)
-memory_rag_chat_lookback_k: 5 # Increased default for more chat context
+memory_rag_chat_lookback_k: 5
 
 
 # Add any other Everquest-specific overrides or settings here
@@ -132,3 +149,31 @@ memory_rag_chat_lookback_k: 5 # Increased default for more chat context
 #   ui_elements:
 #     party_member_health_region: [x1, y1, x2, y2] # Conceptual - requires image processing
 #     target_health_region: [x1, y1, x2, y2] 
+
+# --- EverQuest-Specific Gameplay Settings ---
+gameplay_focus:
+  - "Class-specific advice based on detected character type"
+  - "Zone-appropriate warnings and suggestions" 
+  - "Combat situation assessment and recommendations"
+  - "Group role fulfillment and coordination"
+  - "Death recovery and corpse retrieval guidance"
+  - "Faction and alignment considerations"
+
+# Common EverQuest keywords for enhanced detection
+everquest_keywords:
+  classes: ["warrior", "cleric", "paladin", "ranger", "shadow knight", "monk", "bard", "rogue", "wizard", "magician", "necromancer", "enchanter", "druid", "shaman"]
+  zones: ["qeynos", "freeport", "crushbone", "blackburrow", "guk", "sebilis", "chardok", "velious", "kunark", "antonica"]
+  mechanics: ["meditate", "fizzle", "resist", "faction", "bind", "gate", "corpse", "train", "camp", "aggro"]
+  stats: ["strength", "stamina", "agility", "dexterity", "wisdom", "intelligence", "charisma", "mana", "hitpoints"]
+
+# Enhanced conversation context for EverQuest
+conversation_context:
+  game_era: "Classic EverQuest"
+  expansion_awareness: "Focus on original zones and classic mechanics"
+  player_assistance_style: "Experienced mentor providing practical advice"
+  
+# TTS Settings optimized for EverQuest commentary
+tts_settings:
+  voice_tone: "calm_informative"  # Less excited than action games
+  speech_rate: 0.9  # Slightly slower for tactical information
+  emphasis_on: ["danger", "death", "low health", "no mana", "faction hit"] 

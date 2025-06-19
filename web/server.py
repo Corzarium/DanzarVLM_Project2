@@ -304,6 +304,24 @@ def get_prompts():
     
     return jsonify(prompts)
 
+@app.route('/api/discord_status')
+def get_discord_status():
+    """Endpoint to get the Discord bot's status"""
+    if not app_context:
+        return jsonify({'error': 'Server not initialized'}), 500
+
+    # Check if discord bot instance exists
+    if not app_context.discord_bot_instance:
+        return jsonify({'status': 'offline', 'message': 'Discord bot is not initialized'}), 200
+
+    is_ready = app_context.discord_bot_instance.is_ready()
+    bot_name = app_context.discord_bot_instance.user.name if app_context.discord_bot_instance.user else "Unknown"
+
+    status = 'online' if is_ready else 'offline'
+    message = f'Discord bot "{bot_name}" is online' if is_ready else f'Discord bot is offline'
+
+    return jsonify({'status': status, 'message': message}), 200
+
 @app.route('/api/upload-image', methods=['POST'])
 def upload_image():
     """Endpoint for uploading an image file for VLM analysis"""

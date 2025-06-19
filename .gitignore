@@ -127,6 +127,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.venv-win
 
 # Spyder project settings
 .spyderproject
@@ -163,4 +164,8 @@ cython_debug/
 /debug*
 /models
 /data
-
+/ffmpeg*
+/llama*
+/kokoro*
+test*
+/models*

@@ -165,6 +165,19 @@ class NDIService:
             self._cleanup_finder_and_library()
             return False
 
+    def _init_ndilib(self, ndi):
+        """Initialize using NDIlib"""
+        if not ndi.initialize():
+            raise RuntimeError("Failed to initialize NDI")
+        
+        self.ndi = ndi
+        self.find_instance = self.ndi.find_create_v2()
+        if not self.find_instance:
+            raise RuntimeError("Failed to create NDI finder")
+            
+        self.recv_instance = None
+        self.logger.info("[NDIService] NDIlib initialized successfully")
+
     def _frame_to_bgr(self, vf: ndi.VideoFrameV2) -> Optional[np.ndarray]:
         try:
             if vf.data is None or vf.xres <= 0 or vf.yres <= 0:
@@ -279,7 +292,7 @@ class NDIService:
             elif frame_type == ndi.FRAME_TYPE_AUDIO:
                 if audio_frame: ndi.recv_free_audio_v2(self.ndi_receiver, audio_frame)
             elif frame_type == ndi.FRAME_TYPE_METADATA:
-                self.logger.debug(f"[NDIService] Metadata frame: {metadata_frame.p_data if metadata_frame else 'N/A'}. Freeing.")
+                self.logger.debug(f"[NDIService] Metadata frame: {metadata_frame.data if metadata_frame else 'N/A'}. Freeing.")
                 if metadata_frame: ndi.recv_free_metadata(self.ndi_receiver, metadata_frame)
             elif frame_type == ndi.FRAME_TYPE_ERROR:
                 self.logger.error("[NDIService] NDI recv_capture_v2 reported FRAME_TYPE_ERROR.")

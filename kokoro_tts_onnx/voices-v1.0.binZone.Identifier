@@ -1,4 +1,0 @@
-[ZoneTransfer]
-ZoneId=3
-ReferrerUrl=https://github.com/thewh1teagle/kokoro-onnx/releases
-HostUrl=https://objects.githubusercontent.com/github-production-release-asset-2e65be/911666237/6a5f8548-2581-40eb-a1ab-220e82b2cc40?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=releaseassetproduction%2F20250507%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250507T204559Z&X-Amz-Expires=300&X-Amz-Signature=1fc5e94804aacc0257c9ae65b415f6106665fda0fc37079dd89f8b52386b69a0&X-Amz-SignedHeaders=host&response-content-disposition=attachment%3B%20filename%3Dvoices-v1.0.bin&response-content-type=application%2Foctet-stream

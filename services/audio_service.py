@@ -6,6 +6,10 @@ import os
 import collections # For deque
 from typing import Optional, List, Dict # Added List and Dict for clarity
 import io # For in-memory audio buffer for the beep
+import logging
+import queue
+import tensorflow as tf
+from collections import deque
 
 # --- Real Implementations (Ensure these are installed) ---
 from openwakeword.model import Model as OWWModel
@@ -13,21 +17,28 @@ import whisper # openai-whisper
 from pydub import AudioSegment # Make sure this is imported
 from pydub.generators import Sine # For generating beep sound
 import torch # For whisper fp16
-import queue # For app_context.tts_queue Full exception
+
+from .tts_service_smart import SmartTTSService # Smart TTS service for multiple providers
 
 # from ..DanzarVLM import AppContext # For type hinting if AppContext is in root
 
 class AudioService:
     def __init__(self, app_context): # app_context: AppContext
-        # ... (rest of __init__ remains the same) ...
-        self.app_context = app_context
-        self.oww_model: Optional[OWWModel] = None
-        self.stt_model: Optional[whisper.Whisper] = None
-        self.logger = self.app_context.logger
+        self.ctx = app_context  # Store as self.ctx to match other services
+        self.logger = app_context.logger
         self.logger.info("[AudioService] Instance created.")
-
+        self.logger.info("[AudioService] Initializing audio systems (TensorFlow Lite Wake Word, STT)...")
+        
+        # Initialize components
+        self.tflite_interpreter = None
+        self.tflite_input_details = None
+        self.tflite_output_details = None
+        self.stt_model = None
+        self.tts_service = SmartTTSService(app_context)
+        
+        # Audio processing buffers
         self.raw_discord_audio_buffer = bytearray()
-        self.oww_processing_buffer = np.array([], dtype=np.int16)
+        self.wake_word_audio_buffer = deque()
 
         self.is_capturing_for_stt = False
         self.stt_audio_capture_chunks: List[np.ndarray] = []
@@ -35,82 +46,92 @@ class AudioService:
         self.stt_consecutive_silent_oww_chunks = 0
         self.stt_vad_grace_period_oww_chunks = 0
 
+        # Update configuration BEFORE initializing audio systems
         self._update_derived_constants_from_config()
+        
+        # Now initialize audio systems with proper configuration
+        self.initialize_audio_systems()
 
 
     def _update_derived_constants_from_config(self):
-        # ... (this method remains the same) ...
-        gs = self.app_context.global_settings
-        profile = self.app_context.active_profile
-
+        """Update derived constants from global settings and active profile"""
+        gs = self.ctx.global_settings
+        profile = self.ctx.active_profile
+        
+        # Audio processing constants
         self.TARGET_SR = gs.get("AUDIO_TARGET_SAMPLE_RATE", 16000)
-        self.OWW_EXPECTED_CHUNK_SAMPLES = gs.get("OWW_CHUNK_SAMPLES", 1280)
         self.RMS_VAD_THRESHOLD_VALUE = gs.get("RMS_VAD_THRESHOLD", 100)
-        self.OWW_VAD_THRESHOLD_VALUE = gs.get("OWW_VAD_THRESHOLD", 0.05)
-        self.OWW_WAKEWORD_THRESHOLD = gs.get("OWW_THRESHOLD", 0.5)
-
+        
+        # Wake word constants
+        self.WAKE_WORD_EXPECTED_SAMPLES = 1536  # 16 * 96 for TensorFlow Lite model
+        self.WAKE_WORD_THRESHOLD = float(gs.get("OWW_THRESHOLD", 0.01))
+        
+        # Get wake word model path and name
         oww_path = profile.oww_model_path_override or gs.get("OWW_CUSTOM_MODEL_PATH")
         if oww_path:
             default_oww_name = os.path.splitext(os.path.basename(oww_path))[0]
-            self.OWW_ACTIVE_MODEL_NAME = profile.oww_model_name_override or gs.get("OWW_CUSTOM_MODEL_NAME", default_oww_name)
+            self.WAKE_WORD_MODEL_PATH = oww_path
+            self.WAKE_WORD_MODEL_NAME = profile.oww_model_name_override or gs.get("OWW_CUSTOM_MODEL_NAME", default_oww_name)
         else:
-            self.OWW_ACTIVE_MODEL_NAME = profile.oww_model_name_override or gs.get("OWW_CUSTOM_MODEL_NAME", "wakeword") # Fallback
-
-        self.STT_MIN_SPEECH_SAMPLES = int(self.TARGET_SR * gs.get("STT_MIN_SPEECH_DURATION_SAMPLES_FACTOR", 0.4))
+            self.WAKE_WORD_MODEL_PATH = None
+            self.WAKE_WORD_MODEL_NAME = profile.oww_model_name_override or gs.get("OWW_CUSTOM_MODEL_NAME", "wakeword")
+        
+        # STT constants
         self.STT_MAX_BUFFER_SAMPLES = int(self.TARGET_SR * gs.get("STT_MAX_AUDIO_BUFFER_SECONDS", 15))
-        self.STT_SILENCE_CHUNKS_TO_END = gs.get("STT_SILENCE_FRAMES_TO_END_SPEECH", 25)
-        self.STT_GRACE_PERIOD_CHUNKS = int(self.TARGET_SR * gs.get("STT_VAD_GRACE_PERIOD_DURATION_S", 0.85) / self.OWW_EXPECTED_CHUNK_SAMPLES)
-
-        self.logger.debug(
-            f"[AudioService] Derived audio constants updated: "
-            f"TargetSR={self.TARGET_SR}, OWWChunk={self.OWW_EXPECTED_CHUNK_SAMPLES}, "
-            f"RMSThresh={self.RMS_VAD_THRESHOLD_VALUE}, OWWActiveModel='{self.OWW_ACTIVE_MODEL_NAME}', "
-            f"OWWThresh={self.OWW_WAKEWORD_THRESHOLD}, STTGraceChunks={self.STT_GRACE_PERIOD_CHUNKS}"
+        self.STT_MIN_SPEECH_DURATION_SAMPLES = int(self.TARGET_SR * gs.get("STT_MIN_SPEECH_DURATION_SAMPLES_FACTOR", 0.2))
+        self.STT_SILENCE_CHUNKS_TO_END = gs.get("STT_SILENCE_FRAMES_TO_END_SPEECH", 50)
+        self.STT_GRACE_PERIOD_CHUNKS = int(self.TARGET_SR * gs.get("STT_VAD_GRACE_PERIOD_DURATION_S", 0.85) / 1280)
+        
+        self.logger.info(
+            f"[AudioService] Audio config updated: "
+            f"TargetSR={self.TARGET_SR}, WakeWordSamples={self.WAKE_WORD_EXPECTED_SAMPLES}, "
+            f"RMSThresh={self.RMS_VAD_THRESHOLD_VALUE}, WakeWordModel='{self.WAKE_WORD_MODEL_NAME}', "
+            f"WakeWordThresh={self.WAKE_WORD_THRESHOLD}, STTGraceChunks={self.STT_GRACE_PERIOD_CHUNKS}"
         )
 
     def initialize_audio_systems(self):
-        # ... (this method remains the same) ...
-        self.logger.info("[AudioService] Initializing audio systems (OWW, STT)...")
-        gs = self.app_context.global_settings
-        profile = self.app_context.active_profile
-        self._update_derived_constants_from_config()
-
-        oww_model_path = profile.oww_model_path_override if profile.oww_model_path_override else gs.get("OWW_CUSTOM_MODEL_PATH")
-
-        if oww_model_path and os.path.exists(oww_model_path):
-            try:
-                self.logger.info(f"[AudioService] Attempting to load OWW model from: {oww_model_path}")
-                self.oww_model = OWWModel(
-                    wakeword_models=[oww_model_path],
-                    enable_speex_noise_suppression=gs.get("OWW_ENABLE_SPEEX", True),
-                    vad_threshold=self.OWW_VAD_THRESHOLD_VALUE
-                )
-                if hasattr(self.oww_model, 'chunk_size') and self.oww_model.chunk_size and self.oww_model.chunk_size != self.OWW_EXPECTED_CHUNK_SAMPLES:
-                    self.logger.warning(f"[AudioService] OWW model's internal chunk_size ({self.oww_model.chunk_size}) differs from configured OWW_EXPECTED_CHUNK_SAMPLES ({self.OWW_EXPECTED_CHUNK_SAMPLES}). Using model's size.")
-                    self.OWW_EXPECTED_CHUNK_SAMPLES = self.oww_model.chunk_size
-                    self._update_derived_constants_from_config() # Recalculate based on new chunk size
-
-                self.logger.info(f"[AudioService] OWW model loaded successfully from {oww_model_path}. Active model key for prediction checks: '{self.OWW_ACTIVE_MODEL_NAME}'")
-            except ImportError as e_imp:
-                 self.logger.error(f"[AudioService] ERROR: ImportError during OWW init: {e_imp}", exc_info=True)
-            except Exception as e:
-                self.logger.error(f"[AudioService] ERROR: Failed to load/initialize OWW model from '{oww_model_path}': {e}", exc_info=True)
-        elif oww_model_path:
-             self.logger.error(f"[AudioService] ERROR: OWW model path '{oww_model_path}' configured but file not found.")
-        else:
-            self.logger.warning("[AudioService] WARNING: OWW_CUSTOM_MODEL_PATH not configured. Wake word detection will be disabled.")
-
-        whisper_model_size = gs.get("WHISPER_MODEL_SIZE", "base.en")
+        """Initialize TensorFlow Lite wake word model and Whisper STT"""
         try:
-            self.logger.info(f"[AudioService] Attempting to load Whisper STT model: {whisper_model_size}")
-            self.stt_model = whisper.load_model(whisper_model_size)
-            self.logger.info(f"[AudioService] Whisper STT model '{whisper_model_size}' loaded successfully.")
-        except ImportError:
-            self.logger.error("[AudioService] ERROR: openai-whisper library or torch not found.", exc_info=True)
+            # Initialize wake word detection with TensorFlow Lite
+            if self.WAKE_WORD_MODEL_PATH:
+                self.logger.info(f"[AudioService] Loading TensorFlow Lite wake word model: {self.WAKE_WORD_MODEL_PATH}")
+                try:
+                    self.tflite_interpreter = tf.lite.Interpreter(model_path=self.WAKE_WORD_MODEL_PATH)
+                    self.tflite_interpreter.allocate_tensors()
+                    
+                    self.tflite_input_details = self.tflite_interpreter.get_input_details()
+                    self.tflite_output_details = self.tflite_interpreter.get_output_details()
+                    
+                    input_shape = self.tflite_input_details[0]['shape']
+                    expected_samples = input_shape[1] * input_shape[2]
+                    
+                    if expected_samples != self.WAKE_WORD_EXPECTED_SAMPLES:
+                        self.logger.warning(f"[AudioService] Model expects {expected_samples} samples, but configured for {self.WAKE_WORD_EXPECTED_SAMPLES}")
+                        self.WAKE_WORD_EXPECTED_SAMPLES = expected_samples
+                    
+                    # Initialize audio buffer for wake word detection
+                    self.wake_word_audio_buffer = deque(maxlen=self.WAKE_WORD_EXPECTED_SAMPLES * 2)
+                    
+                    self.logger.info(f"[AudioService] TensorFlow Lite wake word model loaded successfully!")
+                    self.logger.info(f"[AudioService] Model input shape: {input_shape}, expected samples: {expected_samples}")
+                    
+                except Exception as e:
+                    self.logger.error(f"[AudioService] Failed to load TensorFlow Lite model '{self.WAKE_WORD_MODEL_PATH}': {e}")
+                    self.tflite_interpreter = None
+            
+            # Initialize Whisper STT
+            whisper_model = self.ctx.global_settings.get("WHISPER_MODEL_SIZE", "base.en")
+            self.logger.info(f"[AudioService] Loading Whisper STT model: {whisper_model}")
+            try:
+                self.stt_model = whisper.load_model(whisper_model)
+                self.logger.info(f"[AudioService] Whisper STT model '{whisper_model}' loaded successfully.")
+            except Exception as e:
+                self.logger.error(f"[AudioService] Failed to load Whisper model: {e}")
+                
         except Exception as e:
-            self.logger.error(f"[AudioService] ERROR: Failed to load Whisper model '{whisper_model_size}': {e}", exc_info=True)
-
-        self.logger.info("[AudioService] Audio systems initialization attempt complete.")
+            self.logger.error(f"[AudioService] Audio systems initialization error: {e}")
+            
+        self.logger.info("[AudioService] Audio systems initialization complete.")
 
     def _resample_discord_audio_chunk(self, pcm_data_48k_stereo: bytes) -> Optional[np.ndarray]:
         # ... (this method remains the same) ...
@@ -119,7 +140,11 @@ class AudioService:
             discord_segment = AudioSegment(data=pcm_data_48k_stereo, sample_width=2, frame_rate=48000, channels=2)
             mono_segment = discord_segment.set_channels(1)
             resampled_segment = mono_segment.set_frame_rate(self.TARGET_SR)
-            return np.frombuffer(resampled_segment.raw_data, dtype=np.int16)
+            if resampled_segment and resampled_segment.raw_data:
+                return np.frombuffer(resampled_segment.raw_data, dtype=np.int16)
+            else:
+                self.logger.warning("resampled_segment or resampled_segment.raw_data is None, returning empty array")
+                return np.array([])
         except ImportError: # Should not happen if pydub is installed for beep
             self.logger.error("[AudioService] ERROR: pydub library not found for resampling.", exc_info=True)
             return None
@@ -129,7 +154,7 @@ class AudioService:
 
     def _generate_beep_audio(self) -> Optional[bytes]:
         """Generates a short beep sound as WAV bytes."""
-        gs = self.app_context.global_settings
+        gs = self.ctx.global_settings
         if not gs.get("PLAY_WAKE_WORD_BEEP", False):
             return None
 
@@ -158,15 +183,31 @@ class AudioService:
             return None
 
     def process_discord_audio_chunk(self, raw_discord_pcm: bytes, user_id: int):
-        # ... (initial part of the method is the same) ...
-        self.logger.info(f"[AudioService.PROCESS_CHUNK_ENTRY] User ID: {user_id}, Data len: {len(raw_discord_pcm)}, OWW Model Loaded: {self.oww_model is not None}, STT Model Loaded: {self.stt_model is not None}, IsCapturingSTT: {self.is_capturing_for_stt}, STTUser: {self.stt_user_speaking_id}")
-        if not self.oww_model:
+        """Process Discord audio chunk for wake word detection and STT"""
+        # Enhanced entry logging with comprehensive status
+        self.logger.debug(f"[AudioService.DISCORD_CHUNK] User {user_id}: {len(raw_discord_pcm)} bytes | OWW={self.tflite_interpreter is not None} | STT={self.stt_model is not None} | Capturing={self.is_capturing_for_stt} | STTUser={self.stt_user_speaking_id}")
+        
+        if not self.tflite_interpreter:
+            self.logger.warning("[AudioService] Wake word model not loaded - skipping audio processing")
             return
 
         self.raw_discord_audio_buffer.extend(raw_discord_pcm)
+        buffer_size_before = len(self.raw_discord_audio_buffer) - len(raw_discord_pcm)
+        
+        # Log buffer activity periodically
+        if hasattr(self, '_last_buffer_log_time'):
+            if time.time() - self._last_buffer_log_time >= 15:  # Every 15 seconds
+                self.logger.info(f"[AudioService.BUFFER_STATUS] Raw buffer: {len(self.raw_discord_audio_buffer)} bytes | Wake word buffer: {len(self.wake_word_audio_buffer)} samples | User {user_id}")
+                self._last_buffer_log_time = time.time()
+        else:
+            self._last_buffer_log_time = time.time()
 
         DISCORD_PACKET_DURATION_MS = 20
         BYTES_PER_DISCORD_PACKET = int(48000 * (DISCORD_PACKET_DURATION_MS / 1000) * 2 * 2)
+
+        packets_to_process = len(self.raw_discord_audio_buffer) // BYTES_PER_DISCORD_PACKET
+        if packets_to_process > 0:
+            self.logger.debug(f"[AudioService.PACKET_PROCESSING] Processing {packets_to_process} Discord packets from user {user_id}")
 
         while len(self.raw_discord_audio_buffer) >= BYTES_PER_DISCORD_PACKET:
             chunk_48k_stereo = bytes(self.raw_discord_audio_buffer[:BYTES_PER_DISCORD_PACKET])
@@ -176,65 +217,60 @@ class AudioService:
             if resampled_16k_mono_np is None or resampled_16k_mono_np.size == 0:
                 continue
 
-            self.oww_processing_buffer = np.concatenate((self.oww_processing_buffer, resampled_16k_mono_np))
+            self.wake_word_audio_buffer.extend(resampled_16k_mono_np)
 
-            while len(self.oww_processing_buffer) >= self.OWW_EXPECTED_CHUNK_SAMPLES:
-                oww_chunk_to_process = self.oww_processing_buffer[:self.OWW_EXPECTED_CHUNK_SAMPLES].copy()
-                self.oww_processing_buffer = self.oww_processing_buffer[self.OWW_EXPECTED_CHUNK_SAMPLES:]
+            while len(self.wake_word_audio_buffer) >= self.WAKE_WORD_EXPECTED_SAMPLES:
+                # Convert deque to numpy array for processing
+                chunk_samples = list(self.wake_word_audio_buffer)[:self.WAKE_WORD_EXPECTED_SAMPLES]
+                oww_chunk_to_process = np.array(chunk_samples, dtype=np.int16)
+                
+                # Remove processed samples from buffer
+                for _ in range(self.WAKE_WORD_EXPECTED_SAMPLES):
+                    self.wake_word_audio_buffer.popleft()
 
                 if not self.is_capturing_for_stt:
                     try:
-                        raw_prediction_output = self.oww_model.predict(oww_chunk_to_process)
-                        # ... (OWW debug logging as before) ...
-                        self.logger.info(f"[AudioService.OWW_DEBUG] Raw prediction_output type: {type(raw_prediction_output)}")
-                        self.logger.info(f"[AudioService.OWW_DEBUG] Raw prediction_output content: {raw_prediction_output}")
-
-                        current_prediction_dict: Optional[Dict[str, float]] = None 
-                        if isinstance(raw_prediction_output, list): 
-                            if raw_prediction_output:
-                                current_prediction_dict = raw_prediction_output[0] 
-                        elif isinstance(raw_prediction_output, dict): 
-                            current_prediction_dict = raw_prediction_output
-
-                        if current_prediction_dict:
-                            self.logger.info(
-                                f"[AudioService.OWW_PREDICT] User: {user_id}, "
-                                f"TargetModel: '{self.OWW_ACTIVE_MODEL_NAME}', "
-                                f"Score: {current_prediction_dict.get(self.OWW_ACTIVE_MODEL_NAME, 0.0):.4f}, "
-                                f"Threshold: {self.OWW_WAKEWORD_THRESHOLD}, "
-                                f"FullPrediction: {current_prediction_dict}"
-                            )
-
-                            if self.OWW_ACTIVE_MODEL_NAME in current_prediction_dict and \
-                               current_prediction_dict[self.OWW_ACTIVE_MODEL_NAME] >= self.OWW_WAKEWORD_THRESHOLD:
-
-                                self.logger.info(f"!!! WAKE WORD '{self.OWW_ACTIVE_MODEL_NAME}' DETECTED !!! User: {user_id}, Score: {current_prediction_dict[self.OWW_ACTIVE_MODEL_NAME]:.3f}")
-                                
-                                # --- PLAY BEEP ON WAKE WORD ---
-                                if self.app_context.global_settings.get("PLAY_WAKE_WORD_BEEP", False):
-                                    beep_audio_bytes = self._generate_beep_audio()
-                                    if beep_audio_bytes:
-                                        try:
-                                            self.app_context.tts_queue.put_nowait(beep_audio_bytes)
-                                            self.logger.debug("[AudioService] Wake word confirmation beep queued for playback.")
-                                        except queue.Full: # Make sure 'queue' module is imported
-                                            self.logger.warning("[AudioService] TTS queue full, wake word beep dropped.")
-                                # --- END BEEP ---
-
-                                self.is_capturing_for_stt = True
-                                self.stt_user_speaking_id = user_id
-                                # ... (rest of the STT capture initiation) ...
-                                self.stt_audio_capture_chunks.clear()
-                                self.stt_consecutive_silent_oww_chunks = 0
-                                self.stt_vad_grace_period_oww_chunks = self.STT_GRACE_PERIOD_CHUNKS
-
-                                self.app_context.is_in_conversation.set()
-                                self.app_context.last_interaction_time = time.time()
-                                self.stt_audio_capture_chunks.append(oww_chunk_to_process) # Add the wake word chunk itself
-                                continue # Skip further processing of this chunk for STT VAD if it was a wake word trigger
+                        score = self._predict_wake_word(oww_chunk_to_process)
+                        
+                        # Log wake word prediction results (periodic for non-detection, immediate for detection)
+                        if hasattr(self, '_last_oww_log_time'):
+                            time_since_last_log = time.time() - self._last_oww_log_time
+                            should_log_prediction = time_since_last_log >= 30  # Every 30 seconds for normal activity
                         else:
-                             self.logger.warning(f"[AudioService.OWW_PREDICT] OWW predict() did not return a usable prediction structure. Output: {raw_prediction_output}")
+                            should_log_prediction = True
+                            self._last_oww_log_time = time.time()
+                            
+                        if score >= self.WAKE_WORD_THRESHOLD:
+                            self.logger.info(f"🎯 WAKE WORD '{self.WAKE_WORD_MODEL_NAME}' DETECTED! User: {user_id}, Score: {score:.4f} (threshold: {self.WAKE_WORD_THRESHOLD})")
+                            self._last_oww_log_time = time.time()  # Reset log timer on detection
+                        elif should_log_prediction:
+                            self.logger.info(f"[AudioService.OWW_MONITORING] User {user_id}: Score={score:.4f}, Threshold={self.WAKE_WORD_THRESHOLD}, Samples={len(oww_chunk_to_process)}")
+                            self._last_oww_log_time = time.time()
 
+                        if score >= self.WAKE_WORD_THRESHOLD:
+                            
+                            # --- PLAY BEEP ON WAKE WORD ---
+                            if self.ctx.global_settings.get("PLAY_WAKE_WORD_BEEP", False):
+                                beep_audio_bytes = self._generate_beep_audio()
+                                if beep_audio_bytes:
+                                    try:
+                                        self.ctx.tts_queue.put_nowait(beep_audio_bytes)
+                                        self.logger.debug("[AudioService] Wake word confirmation beep queued for playback.")
+                                    except queue.Full: # Make sure 'queue' module is imported
+                                        self.logger.warning("[AudioService] TTS queue full, wake word beep dropped.")
+                            # --- END BEEP ---
+
+                            self.is_capturing_for_stt = True
+                            self.stt_user_speaking_id = user_id
+                            # ... (rest of the STT capture initiation) ...
+                            self.stt_audio_capture_chunks.clear()
+                            self.stt_consecutive_silent_oww_chunks = 0
+                            self.stt_vad_grace_period_oww_chunks = self.STT_GRACE_PERIOD_CHUNKS
+
+                            self.ctx.is_in_conversation.set()
+                            self.ctx.last_interaction_time = time.time()
+                            self.stt_audio_capture_chunks.append(oww_chunk_to_process) # Add the wake word chunk itself
+                            continue # Skip further processing of this chunk for STT VAD if it was a wake word trigger
                     except Exception as e_oww:
                         self.logger.error(f"[AudioService] Error during OWW prediction: {e_oww}", exc_info=True)
                         continue 
@@ -245,7 +281,7 @@ class AudioService:
                         continue
 
                     self.stt_audio_capture_chunks.append(oww_chunk_to_process)
-                    self.app_context.last_interaction_time = time.time() # Keep updating for conversation timeout
+                    self.ctx.last_interaction_time = time.time() # Keep updating for conversation timeout
 
                     # Simple RMS VAD on the OWW chunk
                     rms_energy = np.sqrt(np.mean(oww_chunk_to_process.astype(np.float32)**2))
@@ -286,30 +322,30 @@ class AudioService:
                         self.stt_consecutive_silent_oww_chunks = 0
                         self.stt_vad_grace_period_oww_chunks = 0 # Reset grace period
 
-                        if len(full_stt_audio_np) >= self.STT_MIN_SPEECH_SAMPLES:
+                        if len(full_stt_audio_np) >= self.STT_MIN_SPEECH_DURATION_SAMPLES:
                             self.logger.info(f"[AudioService] STT audio captured ({len(full_stt_audio_np)/self.TARGET_SR:.2f}s for user {speaking_user_id}). Transcribing...")
                             transcribed_text = self.transcribe_audio(full_stt_audio_np)
 
                             if transcribed_text:
                                 self.logger.info(f"[AudioService] Transcription for user {speaking_user_id}: '{transcribed_text}'")
-                                if self.app_context.llm_service_instance:
+                                if self.ctx.llm_service_instance:
                                      # LLMService will handle clearing the conversation flag after processing
-                                     self.app_context.llm_service_instance.handle_user_text_query(transcribed_text, str(speaking_user_id))
+                                     self.ctx.llm_service_instance.handle_user_text_query_sync(transcribed_text, str(speaking_user_id))
                                 else:
                                     self.logger.error("[AudioService] llm_service_instance not available in app_context! Cannot send transcription.")
                                     # Manually clear if LLM service is missing, to prevent getting stuck
-                                    if self.app_context.is_in_conversation.is_set():
-                                        self.app_context.is_in_conversation.clear()
+                                    if self.ctx.is_in_conversation.is_set():
+                                        self.ctx.is_in_conversation.clear()
                                         self.logger.info("[AudioService] Conversation flag cleared (LLM service missing).")
                             else: # Empty or failed transcription
                                 self.logger.info("[AudioService] Transcription resulted in empty text or failed. Ending conversation state.")
-                                if self.app_context.is_in_conversation.is_set():
-                                    self.app_context.is_in_conversation.clear()
+                                if self.ctx.is_in_conversation.is_set():
+                                    self.ctx.is_in_conversation.clear()
                                     self.logger.info("[AudioService] Conversation flag cleared (empty/failed STT).")
                         else: # Audio too short
                             self.logger.info(f"[AudioService] Captured STT audio too short ({len(full_stt_audio_np)/self.TARGET_SR:.2f}s). Ignoring. Ending conversation state.")
-                            if self.app_context.is_in_conversation.is_set():
-                                self.app_context.is_in_conversation.clear()
+                            if self.ctx.is_in_conversation.is_set():
+                                self.ctx.is_in_conversation.clear()
                                 self.logger.info("[AudioService] Conversation flag cleared (STT audio too short).")
 
     def transcribe_audio(self, audio_data_np: np.ndarray) -> Optional[str]:
@@ -332,7 +368,16 @@ class AudioService:
                 self.logger.debug("[AudioService] CUDA not available, using fp32 for Whisper.")
 
             result = self.stt_model.transcribe(audio_f32, language="en", fp16=use_fp16)
-            transcribed_text = result["text"].strip()
+
+            if result and "text" in result:
+                if isinstance(result["text"], str):
+                    transcribed_text = result["text"].strip()
+                else:
+                    self.logger.error(f"[AudioService] Transcription 'text' is not a string: {type(result['text'])}. Raw output: {result}")
+                    return None
+            else:
+                self.logger.error(f"[AudioService] Transcription result missing 'text' key. Raw output: {result}")
+                return None
 
             self.logger.debug(f"[AudioService] Whisper raw transcription: '{transcribed_text}'")
             return transcribed_text if transcribed_text else None
@@ -341,27 +386,11 @@ class AudioService:
             return None
 
     def fetch_tts_audio(self, text: str) -> Optional[bytes]:
-        # ... (this method remains the same) ...
-        tts_url = self.app_context.global_settings.get("TTS_SERVER_URL")
-        if not tts_url or not text:
-            self.logger.debug(f"[AudioService] TTS request skipped: URL: '{tts_url}', Text: '{text[:20]}...'")
-            return None
-
-        self.logger.info(f"[AudioService] Requesting TTS for: '{text[:50]}...' from {tts_url}")
+        """Get TTS audio for text"""
         try:
-            tts_timeout = self.app_context.global_settings.get("TTS_REQUEST_TIMEOUT_S", 20)
-            response = requests.post(tts_url, json={"text": text}, timeout=tts_timeout)
-            response.raise_for_status()
-            self.logger.info(f"[AudioService] TTS audio received (length: {len(response.content)} bytes).")
-            return response.content
-        except requests.exceptions.Timeout:
-            self.logger.error(f"[AudioService] TTS request timed out ({tts_timeout}s) for '{text[:30]}...'.")
-            return None
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"[AudioService] TTS request failed for '{text[:30]}...': {e}")
-            return None
-        except Exception as e_other:
-            self.logger.error(f"[AudioService] Unexpected error during TTS request: {e_other}", exc_info=True)
+            return self.tts_service.generate_audio(text)
+        except Exception as e:
+            self.logger.error(f"[AudioService] TTS failed: {e}")
             return None
 
     def reinitialize_for_profile(self, new_profile):
@@ -374,9 +403,39 @@ class AudioService:
             self.stt_audio_capture_chunks.clear()
             self.stt_user_speaking_id = None
             # Ensure conversation state is reset if it was active due to STT
-            if self.app_context.is_in_conversation.is_set(): # Check if the event is actually set
-                self.app_context.is_in_conversation.clear()
+            if self.ctx.is_in_conversation.is_set(): # Check if the event is actually set
+                self.ctx.is_in_conversation.clear()
                 self.logger.info("[AudioService] Conversation flag cleared due to profile change during STT.")
         
         # Re-initialize OWW and STT models (which also updates derived constants)
         self.initialize_audio_systems()
+
+    def _predict_wake_word(self, audio_samples: np.ndarray) -> float:
+        """Run wake word detection using TensorFlow Lite model"""
+        if (not self.tflite_interpreter or not self.tflite_input_details or 
+            not self.tflite_output_details or len(audio_samples) != self.WAKE_WORD_EXPECTED_SAMPLES):
+            return 0.0
+        
+        try:
+            # Normalize audio to [-1, 1]
+            normalized_audio = audio_samples.astype(np.float32) / 32768.0
+            
+            # Reshape to match model input [1, 16, 96]
+            input_shape = self.tflite_input_details[0]['shape']
+            input_data = normalized_audio.reshape(input_shape)
+            
+            # Set input tensor
+            self.tflite_interpreter.set_tensor(self.tflite_input_details[0]['index'], input_data)
+            
+            # Run inference
+            self.tflite_interpreter.invoke()
+            
+            # Get output
+            output_data = self.tflite_interpreter.get_tensor(self.tflite_output_details[0]['index'])
+            score = float(output_data[0][0])
+            
+            return score
+            
+        except Exception as e:
+            self.logger.error(f"[AudioService] Error during wake word prediction: {e}")
+            return 0.0

@@ -1,16 +1,19 @@
 # utils/ocr_utils.py
 import cv2
 import numpy as np
-import easyocr
 import json
 import os
+import logging
 from typing import Optional, List, Dict, Tuple
+
+logger = logging.getLogger("DanzarVLM.OCRProcessor")
 
 class OCRProcessor:
     def __init__(self, app_context):
         self.ctx = app_context
         self.logger = self.ctx.logger
         self.reader = None
+        self.ocr_enabled = False
         self.ocr_settings = {} # Will be loaded from game profile
         self.ocr_layout_rois: Dict[str, Dict] = {} # Loaded from ocr_layout_path
 
@@ -54,11 +57,14 @@ class OCRProcessor:
                 except ImportError:
                     self.logger.warning("[OCRProcessor] PyTorch not found. GPU support requires PyTorch. Falling back to CPU.")
             
+            import easyocr
             self.reader = easyocr.Reader(languages, gpu=use_gpu)
+            self.ocr_enabled = True
             self.logger.info("[OCRProcessor] EasyOCR Reader initialized successfully.")
         except Exception as e:
             self.logger.error(f"[OCRProcessor] Error initializing EasyOCR Reader: {e}", exc_info=True)
             self.reader = None
+            self.ocr_enabled = False
 
     def _load_ocr_layout(self):
         self.ocr_layout_rois = {} 
@@ -135,7 +141,7 @@ class OCRProcessor:
         Otherwise, processes the full image using default settings.
         Returns a list of strings, like ["ROI_Name: text found", "Another_ROI: other text"].
         """
-        if not self.reader:
+        if not self.ocr_enabled or self.reader is None:
             self.logger.warning("[OCRProcessor] EasyOCR reader not initialized. Cannot extract text.")
             return []
 

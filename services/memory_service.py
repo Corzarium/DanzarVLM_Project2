@@ -74,9 +74,13 @@ class MemoryService:
             self.recent_memories = deque(old_items, maxlen=new_maxlen)
             self.logger.info(f"[MemoryService] Updated recent_memories maxlen to {new_maxlen}")
 
-    def store_memory(self, entry: MemoryEntry):
-        """Store a memory both in short-term and long-term storage."""
+    def store_memory(self, entry: MemoryEntry) -> bool:
         try:
+            # Check if memory storage is disabled
+            if self.ctx.global_settings.get('DISABLE_MEMORY_STORAGE', False):
+                self.logger.debug(f"[MemoryService] Memory storage disabled, skipping: {entry.content[:50]}...")
+                return True  # Return True to not break the flow
+            
             # Add to short-term memory
             self.recent_memories.append(entry)
             
@@ -99,22 +103,22 @@ class MemoryService:
                 ))
                 conn.commit()
             
-            # Also store in RAG if available
-            if self.ctx.rag_service_instance and self.ctx.active_profile.memory_rag_history_collection_name:
+            # Also store in RAG if available (skip if memory storage disabled)
+            if (self.ctx.rag_service_instance and 
+                self.ctx.active_profile.memory_rag_history_collection_name and
+                not self.ctx.global_settings.get('DISABLE_MEMORY_STORAGE', False)):
+                # Store in RAG with simplified parameters
                 self.ctx.rag_service_instance.ingest_text(
-                    collection_name=self.ctx.active_profile.memory_rag_history_collection_name,
-                    text_content=entry.content,
-                    metadata={
-                        **entry.metadata,
-                        "source": entry.source,
-                        "timestamp": entry.timestamp,
-                        "importance_score": entry.importance_score
-                    }
+                    collection=self.ctx.active_profile.memory_rag_history_collection_name,
+                    text=entry.content,
+                    metadata=entry.metadata
                 )
             
             self.logger.debug(f"[MemoryService] Stored new memory: {entry.content[:50]}...")
+            return True
         except Exception as e:
             self.logger.error(f"[MemoryService] Failed to store memory: {e}", exc_info=True)
+            return False
 
     def get_relevant_memories(self, query: str, top_k: int = 5, min_importance: float = 0.5) -> List[MemoryEntry]:
         """Retrieve relevant memories using both RAG and SQL-based retrieval."""
@@ -126,10 +130,10 @@ class MemoryService:
             game_knowledge_collection = self.ctx.active_profile.rag_collection_name
             if self.ctx.rag_service_instance and game_knowledge_collection:
                 self.logger.debug(f"[MemoryService] Querying game knowledge RAG collection: {game_knowledge_collection}")
-                game_knowledge_results = self.ctx.rag_service_instance.query_rag(
-                    collection_name=game_knowledge_collection,
+                game_knowledge_results = self.ctx.rag_service_instance.query(
+                    collection=game_knowledge_collection,
                     query_text=query,
-                    top_k=top_k # Use profile's rag_top_k or the function's top_k
+                    n_results=top_k # Use profile's rag_top_k or the function's top_k
                 )
                 if game_knowledge_results:
                     self.logger.debug(f"[MemoryService] Retrieved {len(game_knowledge_results)} results from game knowledge RAG.")
@@ -149,10 +153,10 @@ class MemoryService:
             history_collection = self.ctx.active_profile.memory_rag_history_collection_name
             if self.ctx.rag_service_instance and history_collection and history_collection != game_knowledge_collection: # Avoid double querying the same collection
                  self.logger.debug(f"[MemoryService] Querying chat history RAG collection: {history_collection}")
-                 history_rag_results = self.ctx.rag_service_instance.query_rag(
-                     collection_name=history_collection,
+                 history_rag_results = self.ctx.rag_service_instance.query(
+                     collection=history_collection,
                      query_text=query,
-                     top_k=getattr(self.ctx.active_profile, 'memory_rag_chat_lookback_k', 5) # Use specific lookback setting
+                     n_results=getattr(self.ctx.active_profile, 'memory_rag_chat_lookback_k', 5) # Use specific lookback setting
                  )
                  if history_rag_results:
                      self.logger.debug(f"[MemoryService] Retrieved {len(history_rag_results)} results from history RAG.")
@@ -304,4 +308,4 @@ class MemoryService:
                 return {}
         except Exception as e:
             self.logger.error(f"[MemoryService] Failed to get memory stats: {e}", exc_info=True)
-            return {} 
+            return {}

@@ -26,12 +26,16 @@ document.addEventListener('DOMContentLoaded', function() {
     const ocrEnabledPromptDisplay = document.getElementById('ocrEnabledPromptDisplay');
     const ocrDisabledPromptDisplay = document.getElementById('ocrDisabledPromptDisplay');
     const chatPromptDisplay = document.getElementById('chatPromptDisplay');
+    const discordStatusMessage = document.getElementById('discordStatusMessage');
 
     // Initialize state
     fetchCurrentState();
-    
+
     // Fetch prompts initially
     fetchPrompts();
+    
+    // Fetch Discord bot status
+    fetchDiscordStatus();
 
     // Event Listeners
     commentaryToggle.addEventListener('change', function() {
@@ -130,6 +134,22 @@ document.addEventListener('DOMContentLoaded', function() {
             .catch(error => {
                 console.error('Error fetching state:', error);
                 updateStatus('Error connecting to server', 'danger');
+            });
+    }
+    
+    function fetchDiscordStatus() {
+        fetch('/api/discord_status')
+            .then(response => response.json())
+            .then(data => {
+                if (discordStatusMessage) {
+                    discordStatusMessage.textContent = `Discord Bot Status: ${data.message}`;
+                }
+            })
+            .catch(error => {
+                console.error('Error fetching Discord status:', error);
+                if (discordStatusMessage) {
+                    discordStatusMessage.textContent = 'Error fetching Discord bot status';
+                }
             });
     }
 

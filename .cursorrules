@@ -1,0 +1,233 @@
+# DanzarAI Cursor IDE Rules
+
+## Project Overview
+**DanzarAI** - Python-based gaming commentary assistant
+- Location: E:\DanzarAI
+- Core Services: NDI capture, RAG memory (Qdrant), LLM (Ollama), TTS (Chatterbox), Discord integration
+- Architecture: Microservices pattern with containerized external dependencies
+
+## Global IDE Rules
+
+### Code Quality Standards
+- **Be Specific**: Define tasks clearly with relevant code examples and detailed descriptions
+- **Consistent Naming**: Use snake_case for functions/variables, PascalCase for classes
+- **Type Annotations**: Always include type hints for function parameters and return values
+- **Docstrings**: Document all classes and public methods with clear, concise docstrings
+- **DRY Principle**: Don't repeat yourself - extract common functionality into utilities
+- **KISS Principle**: Keep it simple, stupid - prefer readable over clever code
+- **YAGNI Principle**: You aren't gonna need it - implement minimal, focused changes
+
+### Development Workflow
+- **Chain-of-Thought**: Outline reasoning in comments before implementing complex logic
+- **Error Handling**: Always include proper exception handling with specific error types
+- **Logging**: Use structured logging with appropriate levels (DEBUG, INFO, WARNING, ERROR)
+- **Testing**: Write pytest tests for new features before implementation
+- **Validation**: Ensure no broken imports or missing dependencies
+
+## Repository-Specific Rules
+
+### Environment Configuration
+- **Virtual Environments**: 
+  - `.venv` for WSL/Linux development
+  - `.venv-win` for Windows development
+- **Configuration**: Update `config/global_settings.yaml` for all service endpoints
+- **Dependencies**: Maintain both environments with consistent packages
+
+### Service Endpoints
+```yaml
+# Container-based endpoints (production)
+TTS_ENDPOINT: "http://chatterbox:8055/tts"
+LLM_ENDPOINT: "http://ollama:11434/chat/completions" 
+RAG_HOST: "qdrant"
+RAG_PORT: 6333
+```
+
+### Container Hostnames
+- **chatterbox**: TTS service container
+- **ollama**: LLM service container  
+- **qdrant**: Vector database container
+- **danzar**: Main application container
+
+### File Structure Standards
+```
+services/           # Core service implementations
+├── ndi_service.py     # NDI frame capture
+├── memory_service.py  # RAG memory management
+├── model_client.py    # LLM API client
+├── tts_service.py     # Text-to-speech
+└── llm_service.py     # LLM orchestration
+
+discord_integration/   # Discord bot integration
+├── bot_client.py      # Main bot client
+└── audio_sink.py      # Audio processing
+
+config/               # Configuration files
+├── global_settings.yaml  # Main configuration
+└── profiles/            # Game-specific profiles
+
+logs/                 # Logging output
+├── errors/           # Error logs for Discord surfacing
+└── debug/            # Debug information
+```
+
+### Code Patterns
+
+#### Service Initialization Pattern
+```python
+class ServiceName:
+    def __init__(self, app_context: AppContext):
+        self.app_context = app_context
+        self.logger = app_context.logger
+        self.config = app_context.global_settings
+        # Initialize service-specific components
+    
+    async def initialize(self) -> bool:
+        """Initialize service with proper error handling."""
+        try:
+            # Initialization logic
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to initialize {self.__class__.__name__}: {e}")
+            return False
+```
+
+#### Error Handling Pattern
+```python
+try:
+    # Service operation
+    result = await service_operation()
+    self.logger.info(f"Operation successful: {result}")
+    return result
+except SpecificException as e:
+    self.logger.error(f"Specific error in {operation_name}: {e}")
+    # Log to errors directory for Discord surfacing
+    raise
+except Exception as e:
+    self.logger.error(f"Unexpected error in {operation_name}: {e}", exc_info=True)
+    raise
+```
+
+#### Configuration Access Pattern
+```python
+def get_config_value(self, key: str, default=None, required: bool = False):
+    """Safely retrieve configuration values."""
+    value = self.config.get(key, default)
+    if required and value is None:
+        raise ConfigurationError(f"Required configuration key '{key}' not found")
+    return value
+```
+
+### Testing Standards
+- **Pytest Framework**: Use pytest for all test implementations
+- **Mock External Services**: Mock NDI, Discord, LLM, and TTS services
+- **Integration Tests**: Test service interaction patterns
+- **Configuration Tests**: Validate configuration loading and validation
+
+### Logging Standards
+```python
+# Use structured logging with context
+self.logger.info(
+    f"[{self.__class__.__name__}] {operation_name} completed",
+    extra={
+        'service': self.__class__.__name__,
+        'operation': operation_name,
+        'duration_ms': duration,
+        'status': 'success'
+    }
+)
+```
+
+### Error Surfacing
+- **Critical Errors**: Log to `logs/errors/` for Discord bot notification
+- **Service Failures**: Include service name, timestamp, and stack trace
+- **Configuration Issues**: Surface missing or invalid configuration immediately
+
+## Development Workflow
+
+### Before Making Changes
+1. **Understand Context**: Read related service code and configuration
+2. **Check Dependencies**: Verify all imports and service connections
+3. **Plan Changes**: Outline approach in comments before implementation
+4. **Consider Impact**: Assess effects on other services and components
+
+### Implementation Process
+1. **Write Tests First**: Create pytest tests for new functionality
+2. **Implement Minimally**: Add only necessary code to pass tests
+3. **Document Changes**: Update docstrings and add inline comments
+4. **Validate Integration**: Ensure service connectivity and proper error handling
+5. **Update Configuration**: Modify `global_settings.yaml` if needed
+
+### Code Review Checklist
+- [ ] Type annotations present and correct
+- [ ] Proper error handling with specific exceptions
+- [ ] Structured logging with appropriate levels
+- [ ] Configuration values properly accessed and validated
+- [ ] No hardcoded values (use configuration)
+- [ ] Docstrings for public methods and classes
+- [ ] Import statements organized and necessary
+- [ ] Threading considerations for concurrent operations
+
+## Service-Specific Guidelines
+
+### NDI Service (`services/ndi_service.py`)
+- Handle frame capture timeouts gracefully
+- Implement proper resource cleanup
+- Use threading for non-blocking capture
+
+### Memory Service (`services/memory_service.py`)  
+- Validate Qdrant connections before operations
+- Implement proper vector embedding handling
+- Cache frequently accessed memories
+
+### LLM Service (`services/llm_service.py`)
+- Handle Ollama API timeouts and retries
+- Implement proper prompt templating
+- Validate model availability before requests
+
+### TTS Service (`services/tts_service.py`)
+- Validate Chatterbox endpoint connectivity
+- Handle audio format conversions properly
+- Implement audio playback queuing
+
+### Discord Integration (`discord_integration/bot_client.py`)
+- Handle Discord API rate limits
+- Implement proper voice channel management
+- Surface critical errors to designated Discord channels
+
+## Configuration Management
+
+### Global Settings Structure
+```yaml
+# Service Endpoints
+TTS_SERVER:
+  provider: "custom"
+  endpoint: "http://chatterbox:8055/tts"
+  timeout: 30
+
+LLM_SERVER:
+  provider: "custom" 
+  endpoint: "http://ollama:11434/chat/completions"
+  timeout: 60
+
+QDRANT_SERVER:
+  host: "qdrant"
+  port: 6333
+  default_collection: "danzar_knowledge"
+
+# Discord Configuration
+DISCORD_BOT_TOKEN: "your_token_here"
+DISCORD_GUILD_ID: 12345
+DISCORD_TEXT_CHANNEL_ID: 12345
+DISCORD_VOICE_CHANNEL_ID: 12345
+
+# Logging Configuration
+LOG_LEVEL: "INFO"
+DEBUG_OUTPUT_PATH: "./debug_frames"
+```
+
+### Profile-Based Configuration
+- Game-specific settings in `config/profiles/`
+- Override global settings per game profile
+- Validate profile completeness on load
+
+Remember: **Implement minimal, focused changes that solve specific problems while maintaining system reliability and code quality.** 

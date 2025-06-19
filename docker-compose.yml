@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # Chatterbox TTS Service with GPU support
+  chatterbox:
+    image: python:3.11-slim
+    container_name: chatterbox-tts
+    ports:
+      - "8055:8055"
+    volumes:
+      - ./docker/chatterbox:/app
+      - chatterbox_models:/app/models
+    working_dir: /app
+    environment:
+      - CUDA_VISIBLE_DEVICES=0  # Use first GPU (RTX 2080 Ti)
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']  # RTX 2080 Ti
+              capabilities: [gpu]
+    command: >
+      bash -c "
+        apt-get update && 
+        apt-get install -y git build-essential &&
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 &&
+        pip install chatterbox-tts flask requests &&
+        python server.py
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8055/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Ollama LLM Service  
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-llm
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - CUDA_VISIBLE_DEVICES=0  # Share GPU with Chatterbox
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-db
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  chatterbox_models:
+  ollama_models:
+  qdrant_storage: 
