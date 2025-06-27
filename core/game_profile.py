@@ -16,6 +16,15 @@ class GameProfile:
     vlm_temperature: float = 0.5
     vlm_max_commentary_sentences: int = 2
 
+    # — Vision Analysis Prompts (for screenshot analysis)
+    vision_prompts: Dict[str, str] = field(default_factory=lambda: {
+        "action": "What is happening in this game screenshot? Describe the main action or activity taking place.",
+        "ui": "Describe the UI elements visible in this game screenshot: health bars, menus, buttons, or interface components.",
+        "scene": "What type of game environment or location is shown in this screenshot?",
+        "character": "Describe any characters, NPCs, or entities visible in this game screenshot.",
+        "quick": "Briefly describe what's happening in this gaming screenshot in 1-2 sentences."
+    })
+
     # — Conversational LLM settings (optional)
     conversational_llm_model: Optional[str] = None
     system_prompt_chat: Optional[str]     = None

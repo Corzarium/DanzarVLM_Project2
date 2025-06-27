@@ -3,5 +3,14 @@
 		{
 			"path": "."
 		}
-	]
+	],
+	"settings": {
+		"files.exclude": {
+			"**/chroma_rag_db": true,
+			"**/webcrawler": true
+			"**/debug*": true
+			"**/.venv": true
+			"**/models": true,
+		}
+	}
 }

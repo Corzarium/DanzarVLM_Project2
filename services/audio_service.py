@@ -120,7 +120,7 @@ class AudioService:
                     self.tflite_interpreter = None
             
             # Initialize Whisper STT
-            whisper_model = self.ctx.global_settings.get("WHISPER_MODEL_SIZE", "base.en")
+            whisper_model = self.ctx.global_settings.get("WHISPER_MODEL_SIZE", "large")
             self.logger.info(f"[AudioService] Loading Whisper STT model: {whisper_model}")
             try:
                 self.stt_model = whisper.load_model(whisper_model)

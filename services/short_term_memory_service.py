@@ -92,11 +92,11 @@ class ShortTermMemoryService:
     def add_entry(self, user_name: str, content: str, entry_type: str = 'user_input', 
                   metadata: Optional[Dict[str, Any]] = None, importance: float = 1.0) -> bool:
         """
-        Add a new memory entry for a user
+        Add a memory entry to the conversation context.
         
         Args:
             user_name: Name of the user
-            content: Content of the entry
+            content: Content of the memory entry
             entry_type: Type of entry ('user_input', 'bot_response', 'system_event')
             metadata: Additional metadata
             importance: Importance score (0.0 to 1.0)
@@ -106,25 +106,41 @@ class ShortTermMemoryService:
         """
         try:
             with self.lock:
-                # Get or create conversation context
-                if user_name not in self.conversations:
-                    if len(self.conversations) >= self.max_conversations:
-                        # Remove oldest conversation
-                        oldest_user = min(self.conversations.keys(), 
-                                        key=lambda u: self.conversations[u].last_activity)
-                        del self.conversations[oldest_user]
-                        self.logger.info(f"[ShortTermMemory] Removed oldest conversation for {oldest_user}")
-                    
-                    self.conversations[user_name] = ConversationContext(user_name=user_name)
-                    self.logger.info(f"[ShortTermMemory] Created new conversation context for {user_name}")
+                # Special handling for VirtualAudio to maintain persistent conversation context
+                if user_name == "VirtualAudio":
+                    # Use a persistent identifier for virtual audio sessions
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
                 
-                context = self.conversations[user_name]
+                # Get or create conversation context
+                if persistent_user_name not in self.conversations:
+                    if len(self.conversations) >= self.max_conversations:
+                        # Remove oldest conversation, but preserve VirtualAudio_Session if it exists
+                        conversations_to_remove = [u for u in self.conversations.keys() if u != "VirtualAudio_Session"]
+                        if conversations_to_remove:
+                            oldest_user = min(conversations_to_remove, 
+                                            key=lambda u: self.conversations[u].last_activity)
+                            del self.conversations[oldest_user]
+                            self.logger.info(f"[ShortTermMemory] Removed oldest conversation for {oldest_user}")
+                        else:
+                            # If only VirtualAudio_Session exists, remove it and recreate
+                            del self.conversations["VirtualAudio_Session"]
+                            self.logger.info(f"[ShortTermMemory] Recreated VirtualAudio_Session conversation")
+                    
+                    self.conversations[persistent_user_name] = ConversationContext(user_name=persistent_user_name)
+                    if persistent_user_name == "VirtualAudio_Session":
+                        self.logger.info(f"[ShortTermMemory] Created persistent conversation context for VirtualAudio")
+                    else:
+                        self.logger.info(f"[ShortTermMemory] Created new conversation context for {user_name}")
+                
+                context = self.conversations[persistent_user_name]
                 
                 # Create memory entry
                 entry = MemoryEntry(
                     content=content,
                     timestamp=time.time(),
-                    user_name=user_name,
+                    user_name=user_name,  # Keep original user_name for display
                     entry_type=entry_type,
                     metadata=metadata or {},
                     importance=importance
@@ -143,6 +159,9 @@ class ShortTermMemoryService:
                 # Detect current game
                 self._detect_current_game(context, content)
                 
+                # Clear cached summary to force regeneration
+                context.conversation_summary = ""
+                
                 self.logger.debug(f"[ShortTermMemory] Added {entry_type} for {user_name}: '{content[:50]}...'")
                 return True
                 
@@ -154,10 +173,16 @@ class ShortTermMemoryService:
         """Get recent conversation context for a user"""
         try:
             with self.lock:
-                if user_name not in self.conversations:
+                # Special handling for VirtualAudio to get persistent context
+                if user_name == "VirtualAudio":
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
+                
+                if persistent_user_name not in self.conversations:
                     return []
                 
-                context = self.conversations[user_name]
+                context = self.conversations[persistent_user_name]
                 # Return most recent entries, up to max_entries
                 recent_entries = list(context.entries)[-max_entries:]
                 
@@ -172,10 +197,16 @@ class ShortTermMemoryService:
         """Get a summary of the conversation with a user"""
         try:
             with self.lock:
-                if user_name not in self.conversations:
+                # Special handling for VirtualAudio to get persistent context
+                if user_name == "VirtualAudio":
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
+                
+                if persistent_user_name not in self.conversations:
                     return ""
                 
-                context = self.conversations[user_name]
+                context = self.conversations[persistent_user_name]
                 
                 # If we have a cached summary, return it
                 if context.conversation_summary:
@@ -207,7 +238,13 @@ class ShortTermMemoryService:
         """Get full conversation context for a user"""
         try:
             with self.lock:
-                return self.conversations.get(user_name)
+                # Special handling for VirtualAudio to get persistent context
+                if user_name == "VirtualAudio":
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
+                
+                return self.conversations.get(persistent_user_name)
         except Exception as e:
             self.logger.error(f"[ShortTermMemory] Error getting user context: {e}")
             return None
@@ -231,7 +268,19 @@ class ShortTermMemoryService:
                 results = []
                 
                 # Search in specific user's conversation or all conversations
-                conversations_to_search = [self.conversations[user_name]] if user_name and user_name in self.conversations else self.conversations.values()
+                if user_name:
+                    # Special handling for VirtualAudio to get persistent context
+                    if user_name == "VirtualAudio":
+                        persistent_user_name = "VirtualAudio_Session"
+                    else:
+                        persistent_user_name = user_name
+                    
+                    if persistent_user_name in self.conversations:
+                        conversations_to_search = [self.conversations[persistent_user_name]]
+                    else:
+                        conversations_to_search = []
+                else:
+                    conversations_to_search = self.conversations.values()
                 
                 for context in conversations_to_search:
                     for entry in context.entries:
@@ -257,6 +306,10 @@ class ShortTermMemoryService:
                 
                 users_to_remove = []
                 for user_name, context in self.conversations.items():
+                    # Don't remove VirtualAudio_Session during cleanup
+                    if user_name == "VirtualAudio_Session":
+                        continue
+                    
                     if current_time - context.last_activity > timeout_seconds:
                         users_to_remove.append(user_name)
                 
@@ -378,14 +431,22 @@ class ShortTermMemoryService:
             return 0.0
     
     def clear_user_memory(self, user_name: str) -> bool:
-        """Clear memory for a specific user"""
+        """Clear all memory for a specific user"""
         try:
             with self.lock:
-                if user_name in self.conversations:
-                    del self.conversations[user_name]
+                # Special handling for VirtualAudio to clear persistent context
+                if user_name == "VirtualAudio":
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
+                
+                if persistent_user_name in self.conversations:
+                    del self.conversations[persistent_user_name]
                     self.logger.info(f"[ShortTermMemory] Cleared memory for {user_name}")
                     return True
-                return False
+                else:
+                    self.logger.warning(f"[ShortTermMemory] No memory found for {user_name}")
+                    return False
         except Exception as e:
             self.logger.error(f"[ShortTermMemory] Error clearing user memory: {e}")
             return False
@@ -419,25 +480,42 @@ class ShortTermMemoryService:
             return {'active_conversations': 0, 'total_entries': 0, 'memory_usage_mb': 0.0}
 
     def clear_conversation(self, user_name: str) -> bool:
-        """Clear conversation for a specific user"""
+        """Clear conversation context for a user (alias for clear_user_memory)"""
         try:
             with self.lock:
-                if user_name in self.conversations:
-                    del self.conversations[user_name]
+                # Special handling for VirtualAudio to clear persistent context
+                if user_name == "VirtualAudio":
+                    persistent_user_name = "VirtualAudio_Session"
+                else:
+                    persistent_user_name = user_name
+                
+                if persistent_user_name in self.conversations:
+                    # Clear entries but keep the context structure
+                    context = self.conversations[persistent_user_name]
+                    context.entries.clear()
+                    context.topic_keywords.clear()
+                    context.current_game = None
+                    context.conversation_summary = ""
+                    context.last_activity = time.time()
                     self.logger.info(f"[ShortTermMemory] Cleared conversation for {user_name}")
                     return True
                 else:
                     self.logger.warning(f"[ShortTermMemory] No conversation found for {user_name}")
                     return False
         except Exception as e:
-            self.logger.error(f"[ShortTermMemory] Error clearing conversation for {user_name}: {e}")
+            self.logger.error(f"[ShortTermMemory] Error clearing conversation: {e}")
             return False
 
     def get_active_conversations(self) -> Dict[str, int]:
         """Get active conversations with entry counts"""
         try:
             with self.lock:
-                return {user: len(ctx.entries) for user, ctx in self.conversations.items()}
+                active = {}
+                for user_name, context in self.conversations.items():
+                    # Map VirtualAudio_Session back to VirtualAudio for display
+                    display_name = "VirtualAudio" if user_name == "VirtualAudio_Session" else user_name
+                    active[display_name] = len(context.entries)
+                return active
         except Exception as e:
             self.logger.error(f"[ShortTermMemory] Error getting active conversations: {e}")
             return {} 

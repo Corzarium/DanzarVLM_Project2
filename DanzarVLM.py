@@ -24,6 +24,11 @@ import numpy as np
 from collections import deque
 import io
 import queue
+import json
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # faster-whisper for efficient STT
 try:
@@ -66,10 +71,21 @@ from services.tts_service import TTSService
 from services.memory_service import MemoryService
 from services.model_client import ModelClient
 from services.llm_service import LLMService
-from services.faster_whisper_stt_service import FasterWhisperSTTService
+from services.faster_whisper_stt_service import WhisperSTTService
 from services.simple_voice_receiver import SimpleVoiceReceiver
-from services.vad_voice_receiver import VADVoiceReceiver
+# VAD Voice Receiver import
+try:
+    from services.vad_voice_receiver import VADVoiceReceiver
+    VAD_VOICE_AVAILABLE = True
+except ImportError:
+    VAD_VOICE_AVAILABLE = False
+    VADVoiceReceiver = None
 from services.short_term_memory_service import ShortTermMemoryService
+
+# MiniGPT-4 Video Service import - REMOVED
+# MiniGPT-4 has been removed from this project
+MINIGPT4_VIDEO_AVAILABLE = False
+MiniGPT4VideoService = None
 
 # Setup logging with Windows compatibility
 logging.basicConfig(
@@ -77,7 +93,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('logs/danzar_voice.log', mode='a', encoding='utf-8')
+        logging.FileHandler('logs/danzar_voice.log', mode='w', encoding='utf-8')  # Changed mode from 'a' to 'w' to reset log each run
     ]
 )
 logger = logging.getLogger("DanzarVLM")
@@ -216,9 +232,9 @@ class AppContext:
         self.model_client: Optional[ModelClient] = None
         self.llm_service: Optional[LLMService] = None
         self.short_term_memory_service: Optional[ShortTermMemoryService] = None
-        self.faster_whisper_stt_service: Optional[FasterWhisperSTTService] = None
+        self.faster_whisper_stt_service: Optional[Any] = None
         self.simple_voice_receiver: Optional[SimpleVoiceReceiver] = None
-        self.vad_voice_receiver: Optional[VADVoiceReceiver] = None
+        self.vad_voice_receiver: Optional[Any] = None
         self.offline_vad_voice_receiver: Optional[Any] = None  # Type will be set when available
         self.qwen_omni_service: Optional[Any] = None  # Qwen2.5-Omni service instance
         self.llamacpp_qwen_service: Optional[Any] = None  # LlamaCpp Qwen service instance
@@ -397,27 +413,30 @@ class AudioFeedbackPrevention:
                     if similarity > 0.8:  # Raised back to 80% for word similarity
                         return True, f"HIGH similarity ({similarity:.1%}) with recent TTS output #{i}"
                 
-                # Word match - only for very high word overlap (70%+)
-                if len(trans_words) >= 3 and len(tts_words) >= 3:
+                # Word match - only for extremely high word overlap (85%+)
+                if len(trans_words) >= 4 and len(tts_words) >= 4:  # Require longer phrases
                     matching_words = sum(1 for word in trans_words if word in tts_words)
                     match_ratio = matching_words / len(trans_words)
-                    if match_ratio >= 0.5:  # 50% word match
+                    if match_ratio >= 0.85:  # Raised from 50% to 85% to prevent false positives
                         return True, f"WORD match ({match_ratio:.1%}) with recent TTS output #{i}"
         
-        # Enhanced TTS echo patterns - more specific to avoid false positives
+        # Enhanced TTS echo patterns - very specific to avoid false positives
         echo_patterns = [
             # Exact TTS response patterns (very specific)
             "i heard you say", "i'm danzar", "danzarai",
             "gaming assistant", "how can i help",
             "that's interesting", "let me help you", "i understand",
-            # EverQuest TTS-specific phrases (from actual TTS responses)
+            # EverQuest TTS-specific phrases (from actual TTS responses) - removed generic terms
             "first they mentioned", "user is confident", "prep expansions ready",
-            "detailed spreadsheet for platinum", "in-game currency",
+            "detailed spreadsheet for platinum", 
             "they want to crush goals", "looking at the tools provided",
-            "there's info on necromancer", "both are", "they mentioned",
+            "there's info on necromancer", "they mentioned",
             # Common TTS response starters
             "looking to maximize their", "so they're probably",
-            "the user is confident with their"
+            "the user is confident with their",
+            # Very specific TTS artifacts that shouldn't be user input
+            "boxing games are fantastic for more than just entertainment",
+            "that's right boxing games are not just fun"
         ]
         
         # Check for pattern matches - only exact or very close matches
@@ -430,7 +449,8 @@ class AudioFeedbackPrevention:
                 return True, f"DOMINANT TTS echo pattern: '{pattern}'"
         
         # Check for common single-word TTS echoes only if they're the entire transcription
-        single_word_echoes = ["danzar", "everquest", "necromancer", "wizard", "expansions", "platinum"]
+        # Reduced to only very specific system words that shouldn't be user input
+        single_word_echoes = ["danzar", "danzarai"]  # Removed game terms that users might legitimately say
         if transcription_clean in single_word_echoes:
             return True, f"SINGLE-WORD TTS echo: '{transcription_clean}'"
         
@@ -541,12 +561,12 @@ class WhisperAudioCapture:
             virtual_devices = self.list_audio_devices()
             working_device_found = False
             
-            for dev_id, dev_info in virtual_devices:
+            for dev_id, dev_name in virtual_devices:
                 if dev_id == working_device_id:
                     device_id = working_device_id
                     working_device_found = True
-                    self.logger.info(f"✅ Selected audio device: {dev_info['name']}")
-                    self.logger.info(f"🎯 Using working VB-Audio device: {dev_info['name']}")
+                    self.logger.info(f"✅ Selected audio device: {dev_name}")
+                    self.logger.info(f"🎯 Using working VB-Audio device: {dev_name}")
                     break
             
             if not working_device_found and virtual_devices:
@@ -572,32 +592,104 @@ class WhisperAudioCapture:
             self.logger.error(f"❌ Failed to select device {device_id}: {e}")
             return False
     
-    async def initialize_whisper(self, model_size: str = "base"):
-        """Initialize Whisper model."""
+    async def initialize_whisper(self, model_size: str = "large"):
+        """Initialize Whisper model with GPU acceleration."""
         try:
-            self.logger.info(f"🔧 Loading Whisper model '{model_size}'...")
+            self.logger.info(f"🔧 Loading Whisper model '{model_size}' with GPU acceleration...")
             self.logger.info("💡 Available models: tiny, base, small, medium, large")
             self.logger.info("💡 Accuracy: tiny < base < small < medium < large")
             self.logger.info("💡 Speed: large < medium < small < base < tiny")
             
+            # Get GPU configuration from settings
+            whisper_gpu_config = self.app_context.global_settings.get('WHISPER_GPU_CONFIG', {})
+            preferred_device = whisper_gpu_config.get('device', 'cuda:0')
+            compute_type = whisper_gpu_config.get('compute_type', 'float16')
+            
+            self.logger.info(f"🎯 Preferred GPU device: {preferred_device}")
+            self.logger.info(f"🎯 Compute type: {compute_type}")
+            
             loop = asyncio.get_event_loop()
             start_time = time.time()
+            
             if WHISPER_AVAILABLE and whisper:
-                self.whisper_model = await loop.run_in_executor(
-                    None,
-                    whisper.load_model,
-                    model_size
-                )
+                # Load model with GPU acceleration
+                def load_whisper_with_gpu():
+                    try:
+                        # Try to use GPU acceleration
+                        import torch
+                        if torch.cuda.is_available():
+                            # Check available GPUs and their memory
+                            gpu_count = torch.cuda.device_count()
+                            self.logger.info(f"🎯 Found {gpu_count} CUDA devices")
+                            
+                            # Try preferred device first
+                            try:
+                                device_id = int(preferred_device.split(':')[1]) if ':' in preferred_device else 0
+                                if device_id < gpu_count:
+                                    # Check memory on preferred device
+                                    torch.cuda.set_device(device_id)
+                                    memory_allocated = torch.cuda.memory_allocated(device_id)
+                                    memory_reserved = torch.cuda.memory_reserved(device_id)
+                                    memory_total = torch.cuda.get_device_properties(device_id).total_memory
+                                    memory_free = memory_total - memory_reserved
+                                    
+                                    self.logger.info(f"🎯 GPU {device_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
+                                    
+                                    # If we have enough memory (at least 2GB free), use this device
+                                    if memory_free > 2 * 1024**3:  # 2GB
+                                        self.logger.info(f"✅ Using preferred GPU {device_id} for Whisper")
+                                        return whisper.load_model(model_size, device=preferred_device)
+                                    else:
+                                        self.logger.warning(f"⚠️ GPU {device_id} has insufficient memory ({memory_free/1024**3:.1f}GB free)")
+                            except Exception as e:
+                                self.logger.warning(f"⚠️ Failed to use preferred device {preferred_device}: {e}")
+                            
+                            # Try to find a GPU with enough memory
+                            for gpu_id in range(gpu_count):
+                                try:
+                                    torch.cuda.set_device(gpu_id)
+                                    memory_allocated = torch.cuda.memory_allocated(gpu_id)
+                                    memory_reserved = torch.cuda.memory_reserved(gpu_id)
+                                    memory_total = torch.cuda.get_device_properties(gpu_id).total_memory
+                                    memory_free = memory_total - memory_reserved
+                                    
+                                    self.logger.info(f"🎯 GPU {gpu_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
+                                    
+                                    if memory_free > 2 * 1024**3:  # 2GB free
+                                        device_str = f"cuda:{gpu_id}"
+                                        self.logger.info(f"✅ Using GPU {gpu_id} for Whisper (device: {device_str})")
+                                        return whisper.load_model(model_size, device=device_str)
+                                except Exception as e:
+                                    self.logger.warning(f"⚠️ Failed to check GPU {gpu_id}: {e}")
+                                    continue
+                            
+                            # If no GPU has enough memory, try CPU
+                            self.logger.warning("⚠️ No GPU has sufficient memory, falling back to CPU")
+                            return whisper.load_model(model_size, device="cpu")
+                        else:
+                            self.logger.warning("⚠️ CUDA not available, falling back to CPU")
+                            return whisper.load_model(model_size, device="cpu")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ GPU loading failed, falling back to CPU: {e}")
+                        return whisper.load_model(model_size, device="cpu")
+                
+                self.whisper_model = await loop.run_in_executor(None, load_whisper_with_gpu)
             else:
                 raise Exception("Whisper not available")
+                
             load_time = time.time() - start_time
             
             self.logger.info(f"✅ Whisper model '{model_size}' loaded successfully in {load_time:.1f}s")
             
-            # Show model info
+            # Show model info and device
             if hasattr(self.whisper_model, 'dims'):
                 dims = self.whisper_model.dims
                 self.logger.info(f"📊 Model info: {dims.n_audio_ctx} audio tokens, {dims.n_text_ctx} text tokens")
+            
+            # Check if model is on GPU
+            if hasattr(self.whisper_model, 'model') and hasattr(self.whisper_model.model, 'device'):
+                device_info = str(self.whisper_model.model.device)
+                self.logger.info(f"🎯 Model loaded on device: {device_info}")
             
             return True
         except Exception as e:
@@ -674,217 +766,48 @@ class WhisperAudioCapture:
                 
                 # Process complete speech segments
                 if speech_ended and len(self.audio_buffer) > 0:
-                    # Check if we should ignore this input due to TTS feedback prevention
-                    # Note: We need to access the bot's feedback prevention through callback
-                    # This is a limitation of the current architecture
-                    # For now, we'll rely on the transcription queue processing to handle TTS blocking
-                    
-                    # Get accumulated audio
+                    # Convert buffer to numpy array
                     speech_audio = np.array(self.audio_buffer, dtype=np.float32)
                     self.audio_buffer.clear()
+                    self.is_speaking = False
+                    self.logger.info(f"🎤 Speech ended (duration: {len(speech_audio) / self.sample_rate:.2f}s)")
                     
-                    # Process with Whisper using direct call instead of async callback
-                    if self.callback_func:
-                        try:
-                            self.logger.info("🎯 Processing speech audio directly...")
-                            
-                            # Call the transcription directly in this thread
-                            # This avoids the event loop threading issues
-                            import asyncio
-                            
-                            # Create a new event loop for this thread
+                    # Process with local Whisper model directly
+                    try:
+                        self.logger.info("🎯 Processing speech audio with local Whisper...")
+                        
+                        # Use local Whisper model directly in this thread
+                        if hasattr(self, 'whisper_model') and self.whisper_model:
                             try:
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
+                                # Run Whisper transcription directly in this thread
+                                result = self.whisper_model.transcribe(speech_audio)
                                 
-                                # Run the callback in this thread's event loop
-                                result = loop.run_until_complete(self.callback_func(speech_audio))
-                                
-                                loop.close()
-                                self.logger.info("✅ Speech processing completed successfully")
-                                
-                            except Exception as loop_error:
-                                self.logger.error(f"❌ Event loop error: {loop_error}")
-                                
-                                # Use direct synchronous processing with queue
-                                try:
-                                    self.logger.info("🔄 Processing with STT service...")
-                                    
-                                    # Check if LlamaCpp Qwen can handle audio directly
-                                    llamacpp_config = self.app_context.global_settings.get('LLAMACPP_QWEN', {})
-                                    self.logger.info(f"🔍 Debug - LlamaCpp config: enabled={llamacpp_config.get('enabled')}, use_for_audio={llamacpp_config.get('use_for_audio')}")
-                                    self.logger.info(f"🔍 Debug - Has service: {hasattr(self.app_context, 'llamacpp_qwen_service')}, Service exists: {getattr(self.app_context, 'llamacpp_qwen_service', None) is not None}")
-                                    if (llamacpp_config.get('enabled') and llamacpp_config.get('use_for_audio') and
-                                        hasattr(self.app_context, 'llamacpp_qwen_service') and self.app_context.llamacpp_qwen_service):
-                                        
-                                        self.logger.info("🎵 Using LlamaCpp Qwen for synchronous audio processing...")
-                                        transcription = self._transcribe_with_llamacpp_sync(speech_audio)
-                                        
-                                        if transcription and len(transcription.strip()) > 0:
-                                            self.logger.info(f"✅ LlamaCpp Qwen transcription: '{transcription}'")
-                                            
-                                            # Put transcription in queue for Discord bot to process
-                                            self.transcription_queue.put({
-                                                'transcription': transcription,
-                                                'timestamp': time.time(),
-                                                'user': 'VirtualAudio'
-                                            })
-                                            self.logger.info("📤 Added LlamaCpp Qwen transcription to queue for Discord processing")
+                                if result and isinstance(result, dict) and 'text' in result:
+                                    transcription = str(result['text']).strip()
+                                    if transcription:
+                                        self.logger.info(f"✅ Local Whisper transcription: '{transcription}'")
+                                        # Put the transcription in the queue for Discord bot to process
+                                        if hasattr(self, 'transcription_queue') and self.transcription_queue:
+                                            self.transcription_queue.put(transcription)
                                         else:
-                                            self.logger.info("🔇 No transcription from LlamaCpp Qwen")
-                                    
-                                    # Fallback to Qwen2.5-Omni if enabled
-                                    elif (self.app_context.global_settings.get('QWEN_OMNI_SERVICE', {}).get('enabled') and 
-                                          self.app_context.global_settings.get('QWEN_OMNI_SERVICE', {}).get('use_for_audio') and
-                                          hasattr(self.app_context, 'qwen_omni_service') and self.app_context.qwen_omni_service):
-                                        
-                                        self.logger.info("🎵 Using Qwen2.5-Omni for synchronous audio processing...")
-                                        transcription = self._transcribe_with_omni_sync(speech_audio)
-                                        
-                                        if transcription and len(transcription.strip()) > 0:
-                                            self.logger.info(f"✅ Qwen2.5-Omni transcription: '{transcription}'")
-                                            
-                                            # Put transcription in queue for Discord bot to process
-                                            self.transcription_queue.put({
-                                                'transcription': transcription,
-                                                'timestamp': time.time(),
-                                                'user': 'VirtualAudio'
-                                            })
-                                            self.logger.info("📤 Added Qwen2.5-Omni transcription to queue for Discord processing")
-                                        else:
-                                            self.logger.info("🔇 No transcription from Qwen2.5-Omni")
-                                    
-                                    # Fallback to faster-whisper
-                                    elif hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service:
-                                        transcription = self.app_context.faster_whisper_stt_service.transcribe_audio_data(speech_audio)
-                                        if transcription and len(transcription.strip()) > 0:
-                                            self.logger.info(f"✅ faster-whisper transcription: '{transcription}'")
-                                            
-                                            # Put transcription in queue for Discord bot to process
-                                            self.transcription_queue.put({
-                                                'transcription': transcription,
-                                                'timestamp': time.time(),
-                                                'user': 'VirtualAudio'
-                                            })
-                                            self.logger.info("📤 Added faster-whisper transcription to queue for Discord processing")
-                                        else:
-                                            self.logger.info("🔇 No transcription from faster-whisper")
+                                            self.logger.warning("No transcription queue available to handle transcription.")
                                     else:
-                                        self.logger.warning("⚠️ No STT service available - audio detected but cannot transcribe")
-                                except Exception as sync_error:
-                                    self.logger.error(f"❌ Synchronous processing failed: {sync_error}")
-                        except Exception as e:
-                            self.logger.error(f"❌ Processing error: {e}")
-                
+                                        self.logger.info("🔇 Empty transcription from local Whisper")
+                                else:
+                                    self.logger.info("🔇 No transcription from local Whisper")
+                            except Exception as e:
+                                self.logger.error(f"❌ Local Whisper error: {e}")
+                        else:
+                            self.logger.warning("⚠️ Local Whisper model not available")
+                            
+                    except Exception as e:
+                        self.logger.error(f"❌ Processing error: {e}")
+                        
             except queue.Empty:
                 continue
             except Exception as e:
                 self.logger.error(f"❌ Processing worker error: {e}")
-        
-        self.logger.info("🎯 Whisper audio processing worker stopped")
-    
-    async def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio data using available STT service."""
-        try:
-            # Basic audio validation
-            if len(audio_data) == 0:
-                return None
-            
-            # Calculate audio metrics
-            audio_duration = len(audio_data) / 16000  # Assuming 16kHz
-            audio_max_volume = np.max(np.abs(audio_data))
-            audio_rms = np.sqrt(np.mean(np.square(audio_data)))
-            
-            self.logger.info(f"🎵 Audio preprocessing - Duration: {audio_duration:.2f}s, Max: {audio_max_volume:.4f}, RMS: {audio_rms:.4f}")
-            
-            # Quality checks
-            if audio_max_volume < 0.01:
-                self.logger.warning(f"🔇 Audio volume too low (max: {audio_max_volume:.4f})")
-                return None
-            
-            if audio_duration < 0.3:
-                self.logger.warning(f"🔇 Audio too short ({audio_duration:.2f}s)")
-                return None
-            
-            # Check if Qwen2.5-Omni can handle audio directly
-            qwen_config = self.app_context.global_settings.get('QWEN_OMNI_SERVICE', {})
-            if (qwen_config.get('enabled') and qwen_config.get('use_for_audio') and
-                hasattr(self.app_context, 'qwen_omni_service') and self.app_context.qwen_omni_service):
-                
-                self.logger.info("🎵 Using Qwen2.5-Omni for direct audio processing...")
-                return await self._transcribe_with_omni(audio_data)
-            
-            # Use faster-whisper STT service
-            elif (hasattr(self.app_context, 'faster_whisper_stt_service') and 
-                self.app_context.faster_whisper_stt_service):
-                
-                self.logger.info("🎯 Using faster-whisper for transcription...")
-                result = self.app_context.faster_whisper_stt_service.transcribe_audio_data(audio_data)
-                
-                if result and len(result.strip()) > 0:
-                    self.logger.info(f"✅ faster-whisper transcription: '{result}'")
-                    return result
-                else:
-                    self.logger.info("🔇 faster-whisper returned no result")
-                    return None
-            else:
-                self.logger.error("❌ No STT service available")
-                return None
-            
-        except Exception as e:
-            self.logger.error(f"❌ Transcription error: {e}")
-            return None
-
-    async def _transcribe_with_omni(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio using Qwen2.5-Omni multimodal model."""
-        try:
-            # Save audio to temporary file for Omni
-            import tempfile
-            import scipy.io.wavfile as wavfile
-            
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                # Convert numpy array to WAV format
-                audio_int16 = np.clip(audio_data * 32767, -32767, 32767).astype(np.int16)
-                wavfile.write(temp_file.name, 16000, audio_int16)
-                temp_file_path = temp_file.name
-            
-            self.logger.info(f"🎵 Saved audio to {temp_file_path}, processing with Qwen2.5-Omni...")
-            
-            # Use Qwen2.5-Omni to process audio directly
-            response = await self.app_context.qwen_omni_service.generate_response(
-                text="Please transcribe the speech in this audio accurately.",
-                audio_path=temp_file_path
-            )
-            
-            # Clean up temporary file
-            import os
-            os.unlink(temp_file_path)
-            
-            if response and len(response.strip()) > 0:
-                # Extract just the transcription from the response
-                transcription = response.strip()
-                
-                # Remove any assistant commentary, keep just the transcription
-                if "transcription:" in transcription.lower():
-                    transcription = transcription.split(":", 1)[1].strip()
-                elif "says:" in transcription.lower():
-                    transcription = transcription.split(":", 1)[1].strip()
-                elif '"' in transcription:
-                    # Extract quoted text if present
-                    import re
-                    quoted = re.findall(r'"([^"]*)"', transcription)
-                    if quoted:
-                        transcription = quoted[0]
-                
-                self.logger.info(f"✅ Qwen2.5-Omni transcription: '{transcription}'")
-                return transcription
-            else:
-                self.logger.info("🔇 Qwen2.5-Omni returned no transcription")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Qwen2.5-Omni transcription error: {e}")
-            return None
+                continue
 
     def _transcribe_with_omni_sync(self, audio_data: np.ndarray) -> Optional[str]:
         """Synchronous version of Qwen2.5-Omni transcription for worker threads."""
@@ -908,12 +831,9 @@ class WhisperAudioCapture:
             
             try:
                 # Run the async Qwen2.5-Omni call in this thread's event loop
-                response = loop.run_until_complete(
-                    self.app_context.qwen_omni_service.generate_response(
-                        text="Please transcribe the speech in this audio accurately.",
-                        audio_path=temp_file_path
-                    )
-                )
+                        # Qwen2.5-Omni service not available
+                        self.logger.warning("⚠️ Qwen2.5-Omni service not available")
+                        response = None
             finally:
                 loop.close()
             
@@ -1156,6 +1076,8 @@ class DanzarVoiceBot(commands.Bot):
     """Enhanced Discord bot with Voice Activity Detection for natural conversation."""
     
     def __init__(self, settings: dict, app_context: AppContext):
+        # Initialize loop attribute for async operations
+        self.loop = None
         # Set up proper intents for voice functionality
         intents = discord.Intents.default()
         intents.message_content = True
@@ -1175,14 +1097,15 @@ class DanzarVoiceBot(commands.Bot):
         # Voice processing components
         self.whisper_model = None
         self.vad_model = None
-        self.faster_whisper_stt_service: Optional[FasterWhisperSTTService] = None
+        self.faster_whisper_stt_service: Optional[Any] = None
         self.simple_voice_receiver: Optional[SimpleVoiceReceiver] = None
-        self.vad_voice_receiver: Optional[VADVoiceReceiver] = None
+        self.vad_voice_receiver: Optional[Any] = None
         self.offline_vad_voice_receiver = None  # Type will be set when available
         
         # Service references
         self.tts_service = None
         self.llm_service = None
+        
         
         # Voice connection tracking
         self.connections: Dict[int, discord.VoiceClient] = {}
@@ -1216,9 +1139,47 @@ class DanzarVoiceBot(commands.Bot):
     async def initialize_services(self):
         """Initialize all required services."""
         try:
-            # Initialize TTS Service
-            self.tts_service = TTSService(self.app_context)
-            # Note: TTSService doesn't have initialize method, it's ready after construction
+            # Load environment variables for TTS configuration
+            from dotenv import load_dotenv
+            load_dotenv()
+            
+            # Initialize Azure TTS Service (replaces Chatterbox TTS)
+            try:
+                from services.tts_service_azure import AzureTTSService
+                
+                # Check if Azure TTS is configured in environment variables
+                azure_tts_key = os.environ.get('AZURE_TTS_SUBSCRIPTION_KEY')
+                if not azure_tts_key:
+                    self.logger.warning("⚠️ Azure TTS subscription key not configured in environment")
+                    self.logger.info("🔄 Falling back to default TTS service...")
+                    from services.tts_service import TTSService
+                    self.tts_service = TTSService(self.app_context)
+                else:
+                    # Update global settings with environment variables
+                    self.app_context.global_settings['AZURE_TTS_SUBSCRIPTION_KEY'] = azure_tts_key
+                    self.app_context.global_settings['AZURE_TTS_REGION'] = os.environ.get('AZURE_TTS_REGION', 'eastus')
+                    self.app_context.global_settings['AZURE_TTS_VOICE'] = os.environ.get('AZURE_TTS_VOICE', 'en-US-AdamMultilingualNeural')
+                    self.app_context.global_settings['AZURE_TTS_SPEECH_RATE'] = os.environ.get('AZURE_TTS_SPEECH_RATE', '+0%')
+                    self.app_context.global_settings['AZURE_TTS_PITCH'] = os.environ.get('AZURE_TTS_PITCH', '+0%')
+                    self.app_context.global_settings['AZURE_TTS_VOLUME'] = os.environ.get('AZURE_TTS_VOLUME', '+0%')
+                    
+                    self.tts_service = AzureTTSService(self.app_context)
+                    if await self.tts_service.initialize():
+                        self.logger.info("✅ Azure TTS Service initialized successfully")
+                        self.logger.info(f"🎤 Voice: {self.tts_service.voice_name}")
+                        self.logger.info(f"🌍 Region: {self.tts_service.region}")
+                    else:
+                        self.logger.error("❌ Azure TTS Service initialization failed")
+                        self.logger.info("🔄 Falling back to default TTS service...")
+                        from services.tts_service import TTSService
+                        self.tts_service = TTSService(self.app_context)
+                        
+            except Exception as e:
+                self.logger.error(f"❌ Failed to initialize Azure TTS Service: {e}")
+                self.logger.info("🔄 Falling back to default TTS service...")
+                from services.tts_service import TTSService
+                self.tts_service = TTSService(self.app_context)
+            
             self.app_context.tts_service = self.tts_service
             self.logger.info("✅ TTS Service initialized")
             
@@ -1227,6 +1188,24 @@ class DanzarVoiceBot(commands.Bot):
             # Note: MemoryService doesn't have initialize method, it's ready after construction
             self.app_context.memory_service = memory_service
             self.logger.info("✅ Memory Service initialized")
+            
+            # Initialize Qwen2.5-VL Integration Service (Primary VLM for OBS + Discord)
+            try:
+                from services.qwen_vl_integration_service import QwenVLIntegrationService
+                self.app_context.qwen_vl_integration = QwenVLIntegrationService(self.app_context)
+                if await self.app_context.qwen_vl_integration.initialize():
+                    self.logger.info("✅ Qwen2.5-VL Integration Service initialized")
+                    self.logger.info("🎯 Primary VLM: CUDA-enabled Qwen2.5-VL for OBS vision + Discord")
+                    
+                    # Get performance stats
+                    stats = self.app_context.qwen_vl_integration.get_performance_stats()
+                    self.logger.info(f"📊 Qwen2.5-VL Stats: CUDA: {stats['cuda_available']}, Fallback: {stats['transformers_fallback']}")
+                else:
+                    self.logger.error("❌ Qwen2.5-VL Integration Service initialization failed")
+                    self.app_context.qwen_vl_integration = None
+            except Exception as e:
+                self.logger.error(f"❌ Qwen2.5-VL Integration Service error: {e}")
+                self.app_context.qwen_vl_integration = None
             
             # Initialize Real-Time Voice Service (Neuro-sama style)
             realtime_voice_config = self.app_context.global_settings.get('REAL_TIME_VOICE', {})
@@ -1288,27 +1267,28 @@ class DanzarVoiceBot(commands.Bot):
                     model_client = ModelClient(app_context=self.app_context)
                     self.logger.info("✅ Standard Model Client initialized")
             
-            # Note: ModelClient doesn't have initialize method, it's ready after construction
+            # Set model client in both places for compatibility
             self.app_context.model_client = model_client
+            self.model_client = model_client  # This fixes the streaming service
             self.logger.info("✅ Model Client initialized")
             
             # Initialize RAG Service (Qdrant connection)
             try:
-                from services.lmstudio_qdrant_rag_service import LMStudioQdrantRAGService
-                rag_service = LMStudioQdrantRAGService(self.app_context.global_settings)
+                from services.llamacpp_rag_service import LlamaCppRAGService
+                rag_service = LlamaCppRAGService(self.app_context.global_settings)
                 self.app_context.rag_service_instance = rag_service
-                self.logger.info("✅ LM Studio + Qdrant RAG Service initialized")
+                self.logger.info("✅ Llama.cpp + Qdrant RAG Service initialized")
             except Exception as e:
                 self.logger.error(f"❌ RAG Service initialization failed: {e}")
                 rag_service = None
             
             # Initialize faster-whisper STT Service with maximum accuracy
-            self.app_context.faster_whisper_stt_service = FasterWhisperSTTService(
+            self.app_context.faster_whisper_stt_service = WhisperSTTService(
                 self.app_context, 
-                model_size="large",  # Upgraded to 'large' for maximum accuracy (RTX 4070 SUPER has 12GB VRAM)
-                device="auto"        # Auto-detect GPU/CPU with optimal settings
+                model_size="medium"  # Changed from 'large' to 'medium' for better performance
+                # Removed device parameter as it's not supported by WhisperSTTService
             )
-            if await asyncio.get_event_loop().run_in_executor(None, self.app_context.faster_whisper_stt_service.initialize):
+            if await self.app_context.faster_whisper_stt_service.initialize():
                 self.logger.info("✅ faster-whisper STT Service initialized")
             else:
                 self.logger.error("❌ faster-whisper STT Service initialization failed")
@@ -1324,14 +1304,22 @@ class DanzarVoiceBot(commands.Bot):
                 self.logger.error("❌ Simple Voice Receiver initialization failed")
             
             # Initialize VAD Voice Receiver (improved version)
-            self.app_context.vad_voice_receiver = VADVoiceReceiver(
-                self.app_context,
-                speech_callback=self.process_vad_transcription
-            )
-            if await self.app_context.vad_voice_receiver.initialize():
-                self.logger.info("✅ VAD Voice Receiver initialized")
+            if VAD_VOICE_AVAILABLE and VADVoiceReceiver:
+                try:
+                    self.app_context.vad_voice_receiver = VADVoiceReceiver(
+                        self.app_context,
+                        speech_callback=self.process_vad_transcription
+                    )
+                    if await self.app_context.vad_voice_receiver.initialize():
+                        self.logger.info("✅ VAD Voice Receiver initialized")
+                    else:
+                        self.logger.error("❌ VAD Voice Receiver initialization failed")
+                except Exception as e:
+                    self.logger.error(f"❌ VAD Voice Receiver error: {e}")
+                    self.app_context.vad_voice_receiver = None
             else:
-                self.logger.error("❌ VAD Voice Receiver initialization failed")
+                self.logger.info("ℹ️ VAD Voice Receiver not available (missing dependencies)")
+                self.app_context.vad_voice_receiver = None
             
             # Initialize Offline VAD Voice Receiver (100% local processing)
             if OFFLINE_VOICE_AVAILABLE and OfflineVADVoiceReceiver:
@@ -1346,7 +1334,23 @@ class DanzarVoiceBot(commands.Bot):
             else:
                 self.logger.info("ℹ️ Offline voice receiver not available (missing dependencies)")
             
-            # Initialize LLM Service with required parameters
+            # Initialize Streaming LLM Service for real-time responses
+            try:
+                from services.streaming_llm_service import StreamingLLMService
+                self.streaming_llm_service = StreamingLLMService(
+                    app_context=self.app_context,
+                    audio_service=None,  # Not needed for voice bot
+                    rag_service=rag_service,    # Use the initialized RAG service
+                    model_client=model_client
+                )
+                self.app_context.streaming_llm_service = self.streaming_llm_service
+                self.logger.info("✅ Streaming LLM Service initialized")
+            except Exception as e:
+                self.logger.error(f"❌ Streaming LLM Service initialization failed: {e}")
+                # Fallback to regular LLM service
+                self.streaming_llm_service = None
+            
+            # Initialize regular LLM Service as fallback
             self.llm_service = LLMService(
                 app_context=self.app_context,
                 audio_service=None,  # Not needed for voice bot
@@ -1357,9 +1361,62 @@ class DanzarVoiceBot(commands.Bot):
             self.app_context.llm_service = self.llm_service
             self.logger.info("✅ LLM Service initialized")
             
+            # Initialize Real-Time Streaming LLM Service for immediate voice responses
+            try:
+                from services.real_time_streaming_llm import RealTimeStreamingLLMService
+                self.real_time_streaming_service = RealTimeStreamingLLMService(
+                    app_context=self.app_context,
+                    model_client=model_client,
+                    tts_service=self.tts_service
+                )
+                if await self.real_time_streaming_service.initialize():
+                    self.logger.info("✅ Real-Time Streaming LLM Service initialized")
+                    self.logger.info("🎵 Voice responses will stream in real-time")
+                else:
+                    self.logger.error("❌ Real-Time Streaming LLM Service initialization failed")
+                    self.real_time_streaming_service = None
+            except Exception as e:
+                self.logger.error(f"❌ Real-Time Streaming LLM Service error: {e}")
+                self.real_time_streaming_service = None
+            
             # Initialize Short-Term Memory Service
             self.app_context.short_term_memory_service = ShortTermMemoryService(self.app_context)
             self.logger.info("✅ Short-Term Memory Service initialized")
+            
+            # Initialize Hybrid Vision Service (replaces MiniGPT-4 Video Service)
+            try:
+                from services.hybrid_vision_service import HybridVisionService
+                self.app_context.hybrid_vision_service = HybridVisionService(self.app_context)
+                if await self.app_context.hybrid_vision_service.initialize():
+                    self.logger.info("✅ Hybrid Vision Service initialized")
+                    self.logger.info("✅ Using Phi-4 for fast video analysis")
+                    
+                    # Get service status
+                    status = self.app_context.hybrid_vision_service.get_status()
+                    self.logger.info(f"📊 Hybrid Service Status: Phi-4: {status['phi4_available']}")
+                else:
+                    self.logger.error("❌ Hybrid Vision Service initialization failed")
+                    self.app_context.hybrid_vision_service = None
+            except ImportError:
+                self.logger.warning("ℹ️ Hybrid Vision Service not available - falling back to basic video analysis")
+                self.app_context.hybrid_vision_service = None
+            except Exception as e:
+                self.logger.error(f"❌ Hybrid Vision Service error: {e}")
+                self.app_context.hybrid_vision_service = None
+            
+            # Initialize Conversational AI Service for turn-taking and game awareness
+            try:
+                from services.conversational_ai_service import ConversationalAIService
+                self.app_context.conversational_ai_service = ConversationalAIService(self.app_context)
+                if await self.app_context.conversational_ai_service.initialize():
+                    self.logger.info("✅ Conversational AI Service initialized")
+                    self.logger.info("🎯 Features: Turn-taking, game awareness, BLIP/CLIP integration")
+                else:
+                    self.logger.error("❌ Conversational AI Service initialization failed")
+                    self.app_context.conversational_ai_service = None
+            except Exception as e:
+                self.logger.error(f"❌ Conversational AI Service error: {e}")
+                self.app_context.conversational_ai_service = None
             
         except Exception as e:
             self.logger.error(f"❌ Service initialization failed: {e}")
@@ -1381,9 +1438,48 @@ class DanzarVoiceBot(commands.Bot):
                 self.logger.info(f"Target channel: {channel.name}")
                 self.logger.info(f"Attempting connection to {channel.name}")
 
-                # Connect with py-cord's native VoiceClient
-                voice_client = await channel.connect()
-                self.logger.info(f"Successfully connected to {channel.name} with py-cord VoiceClient")
+                # Check if already connected to this channel
+                if hasattr(self, 'voice_clients') and self.voice_clients:
+                    for vc in self.voice_clients:
+                        if vc.channel and vc.channel.id == channel.id:
+                            if vc.is_connected():
+                                await ctx.send(f"✅ **Already connected to {channel.name}**\n"
+                                             f"🎤 **Windows Audio Capture Active**\n"
+                                             f"💬 **Ready to process voice input!**")
+                                self.logger.info(f"✅ Already connected to {channel.name}")
+                                return
+                            else:
+                                # Disconnect stale connection
+                                try:
+                                    await vc.disconnect(force=True)
+                                    await asyncio.sleep(1)
+                                except:
+                                    pass
+
+                # Connect with py-cord's native VoiceClient with retry logic
+                max_retries = 3
+                retry_delay = 2
+                
+                for attempt in range(max_retries):
+                    try:
+                        # Disconnect any existing voice connections first
+                        if hasattr(self, 'voice_clients') and self.voice_clients:
+                            for vc in self.voice_clients:
+                                if vc.is_connected():
+                                    await vc.disconnect(force=True)
+                                    await asyncio.sleep(1)
+                        
+                        voice_client = await channel.connect(timeout=30.0)
+                        self.logger.info(f"Successfully connected to {channel.name} with py-cord VoiceClient (attempt {attempt + 1})")
+                        break
+                        
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Voice connection attempt {attempt + 1} failed: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            raise e
                 
                 # Try to use Real-Time Voice Service if available
                 if (hasattr(self.app_context, 'realtime_voice_service') and 
@@ -1405,7 +1501,7 @@ class DanzarVoiceBot(commands.Bot):
                 
                 # Start Windows audio capture for STT instead of Discord voice
                 if not self.virtual_audio:
-                    self.virtual_audio = WhisperAudioCapture(self.app_context, self.process_virtual_audio_sync)
+                    self.virtual_audio = WhisperAudioCapture(self.app_context, None)  # Disabled callback to prevent event loop errors
                     # Initialize faster-whisper for STT
                     if hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service:
                         self.logger.info("✅ Using faster-whisper for STT")
@@ -1466,7 +1562,10 @@ class DanzarVoiceBot(commands.Bot):
                 self.logger.error(f"❌ Error in join command: {e}")
                 await ctx.send(f"❌ Error joining voice channel: {e}")
                 if voice_client:
-                    await voice_client.disconnect()
+                    try:
+                        await voice_client.disconnect()
+                    except:
+                        pass
 
         @self.command(name='leave')
         async def leave_command(ctx):
@@ -1575,7 +1674,7 @@ class DanzarVoiceBot(commands.Bot):
             if action.lower() == "list":
                 # List available devices
                 if not self.virtual_audio:
-                    self.virtual_audio = WhisperAudioCapture(self.app_context, self.process_virtual_audio_sync)
+                    self.virtual_audio = WhisperAudioCapture(self.app_context, None)  # Disabled callback to prevent event loop errors
                 
                 virtual_devices = self.virtual_audio.list_audio_devices()
                 
@@ -1592,9 +1691,10 @@ class DanzarVoiceBot(commands.Bot):
             elif action.lower() == "start":
                 # Start virtual audio recording
                 if not self.virtual_audio:
-                    self.virtual_audio = WhisperAudioCapture(self.app_context, self.process_virtual_audio_sync)
-                    # Initialize Whisper
-                    await self.virtual_audio.initialize_whisper("base")
+                    self.virtual_audio = WhisperAudioCapture(self.app_context, None)  # Disabled callback to prevent event loop errors
+                    # Initialize Whisper with configured model size
+                    model_size = self.app_context.global_settings.get('WHISPER_MODEL_SIZE', 'medium')
+                    await self.virtual_audio.initialize_whisper(model_size)
                 
                 if self.virtual_audio.is_recording:
                     await ctx.send("⚠️ **Virtual audio recording already active!**")
@@ -1832,7 +1932,7 @@ class DanzarVoiceBot(commands.Bot):
                     
                     try:
                         # Create new STT service with the requested model
-                        new_stt_service = FasterWhisperSTTService(
+                        new_stt_service = WhisperSTTService(
                             self.app_context, 
                             model_size=model,
                             device="auto"
@@ -1963,6 +2063,856 @@ class DanzarVoiceBot(commands.Bot):
                 self.logger.error(f"Cleanup command error: {e}")
                 await ctx.send("❌ Cleanup command failed")
 
+        # Video Analysis Commands with FPS Control
+        @self.command(name='video')
+        async def video_command(ctx, action: str = "help", *, args: str = ""):
+            """Main video analysis command with subcommands"""
+            self.logger.info(f"📺 !video {action} used by {ctx.author.name}")
+            
+            if action.lower() == "help":
+                embed = discord.Embed(
+                    title="📺 Video Analysis Commands",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(
+                    name="🎯 Analysis",
+                    value="`!video analyze [prompt]` - Analyze current screen\n"
+                          "`!video quick` - Quick game state analysis\n"
+                          "`!video detailed` - Detailed gameplay analysis",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🎮 Live Monitoring (FPS Optimized)",
+                    value="`!video start [seconds] [fps]` - Start live monitoring\n"
+                          "`!video stop` - Stop live monitoring\n"
+                          "`!video status` - Check monitoring status",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🎬 Qwen2.5-VL Streaming (NEW!)",
+                    value="`!video stream start` - Start Qwen2.5-VL analysis every 30s\n"
+                          "`!video stream stop` - Stop streaming analysis\n"
+                          "`!video stream status` - Check streaming status",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🚀 Qwen2.5-VL Features",
+                    value="• **30-second intervals** - Perfect for gaming commentary\n"
+                          "• **1920x1080 resolution** - High-quality capture\n"
+                          "• **CUDA acceleration** - Fast 4-bit model (~940MB VRAM)\n"
+                          "• **Gaming focus** - Optimized for game analysis",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🔧 Settings",
+                    value="`!video settings` - Show current settings\n"
+                          "`!video quality [low/medium/high]` - Set quality\n"
+                          "`!video fps [0.033/0.05/0.1]` - Set monitoring FPS",
+                    inline=False
+                )
+                embed.add_field(
+                    name="💡 FPS Guide",
+                    value="**0.033** = 30s intervals (ultra-safe)\n"
+                          "**0.05** = 20s intervals (recommended)\n"
+                          "**0.1** = 10s intervals (aggressive)",
+                    inline=False
+                )
+                await ctx.send(embed=embed)
+                
+            elif action.lower() == "analyze":
+                prompt = args if args else "What's happening in this game right now?"
+                await self._video_analyze(ctx, prompt, use_fast_model=False)  # Use detailed model
+                
+            elif action.lower() == "quick":
+                await self._video_analyze(ctx, "Quick analysis: What's the current game state?", use_fast_model=True)  # Use fast model
+                
+            elif action.lower() == "detailed":
+                await self._video_analyze(ctx, "Provide detailed analysis of the current gameplay, including UI elements, characters, and situation.", use_fast_model=False)  # Use detailed model
+                
+            elif action.lower() == "start":
+                try:
+                    parts = args.split() if args else []
+                    duration = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 60
+                    fps = float(parts[1]) if len(parts) > 1 else 0.05  # Default to 20-second intervals
+                    await self._video_start_monitoring(ctx, duration, fps)
+                except ValueError:
+                    await ctx.send("❌ Invalid parameters. Use: `!video start [seconds] [fps]`")
+                    
+            elif action.lower() == "stop":
+                await self._video_stop_monitoring(ctx)
+                
+            elif action.lower() == "status":
+                await self._video_status(ctx)
+                
+            elif action.lower() == "settings":
+                await self._video_settings(ctx)
+                
+            elif action.lower() == "quality":
+                if args.lower() in ["low", "medium", "high"]:
+                    await self._video_quality(ctx, args.lower())
+                else:
+                    await ctx.send("❌ Invalid quality. Use: `!video quality [low/medium/high]`")
+                    
+            elif action.lower() == "fps":
+                try:
+                    fps = float(args) if args else 0.05
+                    if fps <= 0 or fps > 2.0:
+                        await ctx.send("❌ FPS must be between 0.001 and 2.0")
+                        return
+                    interval = 1.0 / fps
+                    await ctx.send(f"✅ **FPS set to {fps}** (analysis every {interval:.1f} seconds)")
+                except ValueError:
+                    await ctx.send("❌ Invalid FPS value. Use: `!video fps [0.033/0.05/0.1]`")
+                    
+            elif action.lower() == "stream":
+                # Handle streaming video commands (batch analysis)
+                subaction = args.split()[0] if args else "help"
+                await self._video_stream_command(ctx, subaction)
+                    
+            else:
+                await ctx.send("❌ Unknown video command. Use `!video help` for available commands.")
+
+        # Qwen2.5-VL Vision Analysis Commands
+        @self.command(name='qwen')
+        async def qwen_command(ctx, action: str = "help", *, args: str = ""):
+            """Qwen2.5-VL vision analysis commands with CUDA acceleration"""
+            self.logger.info(f"🎯 !qwen {action} used by {ctx.author.name}")
+            
+            if action.lower() == "help":
+                embed = discord.Embed(
+                    title="🎯 Qwen2.5-VL Vision Analysis",
+                    description="CUDA-accelerated vision analysis for gaming commentary",
+                    color=discord.Color.purple()
+                )
+                embed.add_field(
+                    name="🔍 Analysis",
+                    value="`!qwen analyze [prompt]` - Analyze current OBS frame\n"
+                          "`!qwen quick` - Quick gaming scene analysis\n"
+                          "`!qwen detailed` - Detailed gameplay analysis\n"
+                          "`!qwen commentary` - Generate live commentary",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🎮 Gaming Focus",
+                    value="`!qwen game` - What game is being played?\n"
+                          "`!qwen action` - What's happening right now?\n"
+                          "`!qwen ui` - Describe UI elements and interface\n"
+                          "`!qwen scene` - Describe the game environment",
+                    inline=False
+                )
+                embed.add_field(
+                    name="📊 Status",
+                    value="`!qwen status` - Show performance stats\n"
+                          "`!qwen history` - Show recent analyses",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚡ Performance",
+                    value="• **CUDA Acceleration** - GPU-powered analysis\n"
+                          "• **Fast Response** - ~2-5 seconds per analysis\n"
+                          "• **High Quality** - Detailed gaming insights",
+                    inline=False
+                )
+                await ctx.send(embed=embed)
+                
+            elif action.lower() == "analyze":
+                prompt = args if args else "Analyze this gaming screenshot. What's happening and what should the player do?"
+                await self._qwen_analyze(ctx, prompt)
+                
+            elif action.lower() == "quick":
+                await self._qwen_analyze(ctx, "Quick analysis: What's the current game state and what's happening?")
+                
+            elif action.lower() == "detailed":
+                await self._qwen_analyze(ctx, "Provide detailed analysis of this gaming scene. Describe the game, characters, UI elements, current situation, and what actions the player might take.")
+                
+            elif action.lower() == "commentary":
+                await self._qwen_commentary(ctx)
+                
+            elif action.lower() == "game":
+                await self._qwen_analyze(ctx, "What video game is being played in this screenshot? Identify the game and describe what type of game it is.")
+                
+            elif action.lower() == "action":
+                await self._qwen_analyze(ctx, "What action or activity is happening in this game right now? Describe what the player is doing or what's occurring.")
+                
+            elif action.lower() == "ui":
+                await self._qwen_analyze(ctx, "Describe the UI elements visible in this game screenshot: health bars, menus, buttons, inventory, or any interface components.")
+                
+            elif action.lower() == "scene":
+                await self._qwen_analyze(ctx, "Describe the game environment or location shown in this screenshot. What type of area is this?")
+                
+            elif action.lower() == "status":
+                await self._qwen_status(ctx)
+                
+            elif action.lower() == "history":
+                await self._qwen_history(ctx)
+                
+            else:
+                await ctx.send("❌ Unknown Qwen command. Use `!qwen help` for available commands.")
+
+        @self.command(name='conversation')
+        async def conversation_command(ctx, action: str = "status", *, args: str = ""):
+            """Manage conversation settings and turn-taking"""
+            try:
+                if not hasattr(self.app_context, 'conversational_ai_service') or not self.app_context.conversational_ai_service:
+                    await ctx.send("❌ **Conversational AI Service not available**")
+                    return
+                
+                service = self.app_context.conversational_ai_service
+                
+                if action == "status":
+                    status = service.get_conversation_status()
+                    embed = discord.Embed(
+                        title="💬 Conversation Status",
+                        color=discord.Color.blue()
+                    )
+                    embed.add_field(name="State", value=status["state"], inline=True)
+                    embed.add_field(name="Current Speaker", value=status["current_speaker"] or "None", inline=True)
+                    embed.add_field(name="History Length", value=status["conversation_length"], inline=True)
+                    embed.add_field(name="Recent Events", value=status["recent_events"], inline=True)
+                    embed.add_field(name="Vision Models", value="✅ Loaded" if status["vision_models_loaded"] else "❌ Not Available", inline=True)
+                    embed.add_field(name="Game Type", value=service.current_game, inline=True)
+                    
+                    await ctx.send(embed=embed)
+                
+                elif action == "clear":
+                    service.clear_conversation_history()
+                    await ctx.send("✅ **Conversation history cleared**")
+                
+                elif action == "game":
+                    if args:
+                        service.set_game_type(args)
+                        await ctx.send(f"🎮 **Game type set to: {args}**")
+                    else:
+                        await ctx.send(f"🎮 **Current game type: {service.current_game}**")
+                
+                elif action == "events":
+                    recent_events = [e for e in service.game_events 
+                                   if time.time() - e.timestamp < 300]  # Last 5 minutes
+                    if recent_events:
+                        embed = discord.Embed(
+                            title="🎮 Recent Game Events",
+                            color=discord.Color.green()
+                        )
+                        for i, event in enumerate(recent_events[-5:], 1):  # Show last 5
+                            embed.add_field(
+                                name=f"Event {i}",
+                                value=f"**{event.event_type}** ({event.confidence:.2f})\n{event.description}",
+                                inline=False
+                            )
+                        await ctx.send(embed=embed)
+                    else:
+                        await ctx.send("📝 **No recent game events detected**")
+                
+                else:
+                    await ctx.send("""💬 **Conversation Commands:**
+- `!conversation status` - Show conversation status
+- `!conversation clear` - Clear conversation history
+- `!conversation game <type>` - Set game type (everquest, generic, etc.)
+- `!conversation events` - Show recent game events""")
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Conversation command error: {e}")
+                await ctx.send("❌ **Error processing conversation command**")
+
+    async def _video_analyze(self, ctx, prompt: str, use_fast_model: bool = False):
+        """Analyze current screen with given prompt using Qwen2.5-VL"""
+        try:
+            # Check if Qwen2.5-VL integration is available
+            if not hasattr(self.app_context, 'qwen_vl_integration') or not self.app_context.qwen_vl_integration:
+                await ctx.send("❌ **Qwen2.5-VL Integration not available**\n"
+                              "Make sure the CUDA server is running and the service is initialized")
+                return
+            
+            model_type = "⚡ Fast Analysis" if use_fast_model else "🧠 Detailed Analysis"
+            await ctx.send(f"📺 **Analyzing current screen with {model_type}...** 🔍")
+            
+            # Capture screenshot from OBS
+            frame = await self.app_context.qwen_vl_integration.capture_obs_frame()
+            if not frame:
+                await ctx.send("❌ **Failed to capture screenshot**\nMake sure OBS Studio is running")
+                return
+            
+            # Analyze with Qwen2.5-VL
+            start_time = time.time()
+            analysis = await self.app_context.qwen_vl_integration.analyze_obs_frame(frame, prompt)
+            analysis_time = time.time() - start_time
+            
+            if analysis:
+                embed = discord.Embed(
+                    title=f"📺 Screen Analysis ({analysis_time:.1f}s)",
+                    description=analysis[:2000] + "..." if len(analysis) > 2000 else analysis,
+                    color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="🎯 Model",
+                    value="Qwen2.5-VL (CUDA)",
+                    inline=True
+                )
+                embed.add_field(
+                    name="⚡ Speed",
+                    value=f"{analysis_time:.1f}s",
+                    inline=True
+                )
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("❌ **Analysis failed**\nPlease try again or check the CUDA server status")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Video analysis error: {e}")
+            await ctx.send(f"❌ **Analysis error**: {str(e)}")
+
+    async def _video_start_monitoring(self, ctx, duration: int, fps: float = 0.05):
+        """Start live video monitoring with configurable FPS using Hybrid Vision Service"""
+        try:
+            # Check if Hybrid Vision Service is available
+            if not hasattr(self.app_context, 'hybrid_vision_service') or not self.app_context.hybrid_vision_service:
+                await ctx.send("❌ **Hybrid Vision Service not available**\n"
+                              "Make sure the vision services are properly set up and OBS Studio is running")
+                return
+            
+            # Check if already monitoring
+            if hasattr(self, '_video_monitoring_task') and self._video_monitoring_task and not self._video_monitoring_task.done():
+                await ctx.send("⚠️ **Video monitoring already active!** Use `!video stop` first.")
+                return
+            
+            interval = 1.0 / fps
+            await ctx.send(f"🎬 **Starting live video monitoring with Hybrid Vision Service**\n"
+                          f"⏱️ Duration: {duration} seconds\n"
+                          f"🎯 FPS: {fps} (analysis every {interval:.1f}s)")
+            
+            # Start monitoring task
+            self._video_monitoring_task = asyncio.create_task(
+                self._video_monitoring_loop(ctx, duration, fps)
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Video monitoring start error: {e}")
+            await ctx.send(f"❌ **Failed to start monitoring**: {str(e)}")
+
+    async def _video_monitoring_loop(self, ctx, duration: int, fps: float = 0.05):
+        """Live video monitoring loop with configurable FPS"""
+        try:
+            start_time = asyncio.get_event_loop().time()
+            end_time = start_time + duration
+            analysis_count = 0
+            
+            # Calculate sleep interval from FPS (frames per second)
+            sleep_interval = 1.0 / fps
+            
+            while asyncio.get_event_loop().time() < end_time:
+                try:
+                    # Analyze current frame
+                    result = await self.obs_service.analyze_current_frame(
+                        "Brief analysis: What's happening now in the game?"
+                    )
+                    
+                    if result and result.get('success'):
+                        analysis_count += 1
+                        analysis = result.get('analysis', 'No analysis')
+                        timing = result.get('timing', {})
+                        
+                        # Send brief update
+                        embed = discord.Embed(
+                            title=f"🎮 Live Analysis #{analysis_count} ({fps} FPS)",
+                            description=analysis[:500] + ("..." if len(analysis) > 500 else ""),
+                            color=discord.Color.blue()
+                        )
+                        
+                        if timing:
+                            embed.add_field(
+                                name="⏱️ Timing",
+                                value=f"Analysis: {timing.get('total_time', 0):.1f}s\nNext in: {sleep_interval:.1f}s",
+                                inline=True
+                            )
+                        
+                        await ctx.send(embed=embed)
+                    
+                    # Wait based on FPS setting
+                    await asyncio.sleep(sleep_interval)
+                    
+                except Exception as e:
+                    self.logger.error(f"Monitoring loop error: {e}")
+                    await asyncio.sleep(5)  # Wait before retry
+            
+            # Monitoring completed
+            await ctx.send(f"✅ **Live monitoring completed!** Analyzed {analysis_count} frames in {duration} seconds at {fps} FPS.")
+            
+        except asyncio.CancelledError:
+            await ctx.send("🛑 **Live monitoring stopped.**")
+        except Exception as e:
+            self.logger.error(f"Video monitoring loop error: {e}")
+            await ctx.send(f"❌ **Monitoring error**: {str(e)}")
+
+    async def _video_stop_monitoring(self, ctx):
+        """Stop live video monitoring"""
+        try:
+            if hasattr(self, '_video_monitoring_task') and self._video_monitoring_task and not self._video_monitoring_task.done():
+                self._video_monitoring_task.cancel()
+                await ctx.send("🛑 **Video monitoring stopped.**")
+            else:
+                await ctx.send("ℹ️ **No active video monitoring to stop.**")
+                
+        except Exception as e:
+            self.logger.error(f"Video stop error: {e}")
+            await ctx.send(f"❌ **Failed to stop monitoring**: {str(e)}")
+
+    async def _video_status(self, ctx):
+        """Show video monitoring status"""
+        try:
+            # Initialize OBS service if not available
+            if not hasattr(self, 'obs_service') or not self.obs_service:
+                from services.obs_video_service import OBSVideoService
+                self.obs_service = OBSVideoService(self.app_context)
+            
+            # Get OBS info
+            obs_info = self.obs_service.get_obs_info()
+            
+            embed = discord.Embed(
+                title="📺 Video Analysis Status",
+                color=discord.Color.blue()
+            )
+            
+            # OBS Connection
+            if obs_info.get('connected', False):
+                embed.add_field(
+                    name="📺 OBS Connection",
+                    value=f"✅ Connected to OBS {obs_info.get('obs_version', 'Unknown')}",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🎬 Current Scene",
+                    value=obs_info.get('current_scene', 'Unknown'),
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="📺 OBS Connection",
+                    value="❌ Not connected to OBS",
+                    inline=False
+                )
+            
+            # Monitoring Status
+            monitoring_active = (hasattr(self, '_video_monitoring_task') and 
+                               self._video_monitoring_task and 
+                               not self._video_monitoring_task.done())
+            
+            embed.add_field(
+                name="🎮 Live Monitoring",
+                value="🟢 Active" if monitoring_active else "🔴 Inactive",
+                inline=True
+            )
+            
+            # Video Settings
+            video_settings = self.app_context.global_settings.get('VIDEO_ANALYSIS', {})
+            embed.add_field(
+                name="⚙️ Settings",
+                value=f"Quality: {video_settings.get('quality', 'medium')}\n"
+                      f"Enabled: {'✅' if video_settings.get('enabled', True) else '❌'}",
+                inline=True
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Video status error: {e}")
+            await ctx.send(f"❌ **Status check failed**: {str(e)}")
+
+    async def _video_settings(self, ctx):
+        """Show current video settings"""
+        try:
+            video_settings = self.app_context.global_settings.get('VIDEO_ANALYSIS', {})
+            
+            embed = discord.Embed(
+                title="⚙️ Video Analysis Settings",
+                color=discord.Color.blue()
+            )
+            
+            embed.add_field(
+                name="🎯 Analysis",
+                value=f"Enabled: {'✅' if video_settings.get('enabled', True) else '❌'}\n"
+                      f"Gaming Mode: {'✅' if video_settings.get('gaming_mode', True) else '❌'}\n"
+                      f"Save Debug Frames: {'✅' if video_settings.get('save_debug_frames', True) else '❌'}",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="🔧 Performance (FPS Optimized)",
+                value=f"Quality: {video_settings.get('quality', 'medium')}\n"
+                      f"Recommended FPS: 0.05 (20s intervals)\n"
+                      f"Ultra-Safe FPS: 0.033 (30s intervals)",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="📺 OBS Integration",
+                value=f"Host: {self.app_context.global_settings.get('OBS_HOST', 'localhost')}\n"
+                      f"Port: {self.app_context.global_settings.get('OBS_PORT', 4455)}\n"
+                      f"Password: {'Set' if self.app_context.global_settings.get('OBS_PASSWORD') else 'None'}",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Video settings error: {e}")
+            await ctx.send(f"❌ **Settings display failed**: {str(e)}")
+
+    async def _video_quality(self, ctx, quality: str):
+        """Set video quality"""
+        try:
+            # Update settings (this would ideally save to config file)
+            if not hasattr(self.app_context, 'global_settings'):
+                await ctx.send("❌ **Settings not available**")
+                return
+            
+            if 'VIDEO_ANALYSIS' not in self.app_context.global_settings:
+                self.app_context.global_settings['VIDEO_ANALYSIS'] = {}
+            
+            self.app_context.global_settings['VIDEO_ANALYSIS']['quality'] = quality
+            
+            # Quality settings mapping
+            quality_settings = {
+                'low': {'capture_quality': 0.5, 'recommended_fps': 0.033},
+                'medium': {'capture_quality': 0.8, 'recommended_fps': 0.05},
+                'high': {'capture_quality': 1.0, 'recommended_fps': 0.1}
+            }
+            
+            settings = quality_settings.get(quality, quality_settings['medium'])
+            self.app_context.global_settings['VIDEO_ANALYSIS'].update(settings)
+            
+            fps = settings['recommended_fps']
+            interval = 1.0 / fps
+            
+            await ctx.send(f"✅ **Video quality set to {quality}**\n"
+                         f"📊 Capture Quality: {settings['capture_quality']}\n"
+                         f"🎯 Recommended FPS: {fps} ({interval:.1f}s intervals)")
+            
+        except Exception as e:
+            self.logger.error(f"Video quality error: {e}")
+            await ctx.send(f"❌ **Quality setting failed**: {str(e)}")
+
+    async def _video_stream_command(self, ctx, subaction: str):
+        """Handle streaming video commands with Qwen2.5-VL 1-minute collection periods"""
+        try:
+            if subaction.lower() == "start":
+                await self._video_stream_start(ctx)
+            elif subaction.lower() == "stop":
+                await self._video_stream_stop(ctx)
+            elif subaction.lower() == "status":
+                await self._video_stream_status(ctx)
+            else:
+                embed = discord.Embed(
+                    title="🎬 Qwen2.5-VL Video Streaming",
+                    description="CUDA-accelerated vision analysis with 1-minute collection periods",
+                    color=discord.Color.purple()
+                )
+                embed.add_field(
+                    name="📸 Collection & Analysis",
+                    value="`!video stream start` - Start 1-minute collection periods\n"
+                          "`!video stream stop` - Stop streaming analysis\n"
+                          "`!video stream status` - Check streaming status",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🚀 How It Works",
+                    value="• **1-minute collection** - Captures frames every 10s\n"
+                          "• **Individual analysis** - Each frame analyzed separately\n"
+                          "• **Comprehensive summary** - All analyses sent to Qwen2.5-VL\n"
+                          "• **Gaming commentary** - Professional-style commentary",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚡ Performance",
+                    value="• Frame analysis: ~4-8 seconds per frame\n"
+                          "• Collection period: 60 seconds (6 frames)\n"
+                          "• Comprehensive analysis: ~10-15 seconds\n"
+                          "• GPU VRAM usage: ~940MB",
+                    inline=False
+                )
+                await ctx.send(embed=embed)
+                
+        except Exception as e:
+            self.logger.error(f"Video stream command error: {e}")
+            await ctx.send(f"❌ **Stream command error**: {str(e)}")
+
+    async def _video_stream_start(self, ctx):
+        """Start Qwen2.5-VL streaming with 1-minute collection periods"""
+        try:
+            # Check if already streaming
+            if hasattr(self, '_qwen_streaming_service') and self._qwen_streaming_service and self._qwen_streaming_service.is_active():
+                await ctx.send("⚠️ **Qwen2.5-VL streaming already active!** Use `!video stream stop` first.")
+                return
+            
+            # Initialize Qwen2.5-VL streaming service
+            from services.qwen_streaming_service import QwenStreamingService
+            self._qwen_streaming_service = QwenStreamingService(self.app_context)
+            
+            # Initialize the streaming service
+            if not await self._qwen_streaming_service.initialize():
+                await ctx.send("❌ **Failed to initialize Qwen2.5-VL streaming service.**\n"
+                              "Make sure the CUDA server is running on port 8083.")
+                return
+            
+            # Set up Discord callback for results
+            async def discord_callback(analysis_result: str, frame_count: int, duration: float):
+                """Send Qwen2.5-VL comprehensive analysis results to Discord with game event detection"""
+                try:
+                    embed = discord.Embed(
+                        title=f"🎯 Qwen2.5-VL Comprehensive Analysis ({frame_count} frames, {duration:.1f}s)",
+                        description=analysis_result[:1500] + ("..." if len(analysis_result) > 1500 else ""),
+                        color=discord.Color.green()
+                    )
+                    
+                    embed.add_field(
+                        name="📊 Analysis Details",
+                        value=f"Frames Analyzed: {frame_count}\nCollection Time: {duration:.1f}s\nModel: Qwen2.5-VL 4-bit",
+                        inline=True
+                    )
+                    
+                    embed.add_field(
+                        name="⏱️ Next Collection",
+                        value="Starting new 1-minute collection period...",
+                        inline=True
+                    )
+                    
+                    await ctx.send(embed=embed)
+                    
+                    # Check for game events using conversational AI service
+                    if (hasattr(self.app_context, 'conversational_ai_service') and 
+                        self.app_context.conversational_ai_service):
+                        
+                        service = self.app_context.conversational_ai_service
+                        
+                        # Analyze text result for notable game events
+                        analysis_lower = analysis_result.lower()
+                        event_keywords = service.game_event_keywords.get(service.current_game, 
+                                                                       service.game_event_keywords["generic"])
+                        
+                        detected_events = []
+                        for keyword in event_keywords:
+                            if keyword in analysis_lower:
+                                # Calculate confidence based on keyword presence
+                                confidence = 0.5  # Base confidence
+                                keyword_count = analysis_lower.count(keyword)
+                                confidence += min(keyword_count * 0.2, 0.3)
+                                
+                                if keyword in service.urgent_keywords:
+                                    confidence += 0.2
+                                
+                                detected_events.append((keyword, confidence))
+                        
+                        if detected_events:
+                            # Get highest confidence event
+                            best_event = max(detected_events, key=lambda x: x[1])
+                            event_type, confidence = best_event
+                            
+                            if confidence > 0.6:  # Only comment on high-confidence events
+                                # Generate commentary
+                                commentary = await service.generate_game_commentary(
+                                    service.GameEvent(
+                                        event_type=event_type,
+                                        description=f"Detected {event_type} in game analysis",
+                                        confidence=confidence,
+                                        timestamp=time.time(),
+                                        context=analysis_result
+                                    )
+                                )
+                                
+                                if commentary:
+                                    # Send commentary to Discord
+                                    commentary_embed = discord.Embed(
+                                        title="🎯 Game Event Detected!",
+                                        description=commentary,
+                                        color=discord.Color.red()
+                                    )
+                                    commentary_embed.add_field(name="Event Type", value=event_type, inline=True)
+                                    commentary_embed.add_field(name="Confidence", value=f"{confidence:.2f}", inline=True)
+                                    
+                                    await ctx.send(embed=commentary_embed)
+                                    
+                                    # Generate TTS for commentary
+                                    if hasattr(self, 'tts_service') and self.tts_service:
+                                        try:
+                                            tts_audio = self.tts_service.generate_audio(commentary)
+                                            if tts_audio:
+                                                await self._queue_tts_audio(tts_audio)
+                                                self.logger.info(f"🎵 TTS generated for game commentary ({len(tts_audio)} bytes)")
+                                        except Exception as e:
+                                            self.logger.error(f"❌ TTS generation error for commentary: {e}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Discord callback error: {e}")
+                    await ctx.send(f"⚠️ Analysis completed but failed to display: {str(e)}")
+            
+            # Start streaming with Discord callback
+            success = await self._qwen_streaming_service.start_streaming(
+                analysis_callback=discord_callback
+            )
+            
+            if success:
+                embed = discord.Embed(
+                    title="🎬 Qwen2.5-VL Streaming Started!",
+                    description="Now collecting frames for 1 minute, then providing comprehensive gaming commentary",
+                    color=discord.Color.green()
+                )
+                
+                embed.add_field(
+                    name="📸 Collection Settings",
+                    value="• Resolution: 1920x1080\n• Quality: 95% JPEG\n• Frame Interval: 10 seconds\n• Collection Period: 60 seconds",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="🧠 Analysis Process",
+                    value="• Individual frame analysis\n• Comprehensive summary generation\n• Professional gaming commentary\n• CUDA acceleration",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="⏱️ Performance",
+                    value="• ~6 frames per collection period\n• ~4-8 seconds per frame analysis\n• ~10-15 seconds for comprehensive analysis\n• GPU VRAM: ~940MB",
+                    inline=False
+                )
+                
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("❌ **Failed to start Qwen2.5-VL streaming.**\n"
+                              "Check OBS connection and CUDA server availability.")
+                
+        except Exception as e:
+            self.logger.error(f"Video stream start error: {e}")
+            await ctx.send(f"❌ **Failed to start streaming**: {str(e)}")
+
+    async def _video_stream_stop(self, ctx):
+        """Stop Qwen2.5-VL streaming"""
+        try:
+            if hasattr(self, '_qwen_streaming_service') and self._qwen_streaming_service:
+                was_active = self._qwen_streaming_service.is_active()
+                await self._qwen_streaming_service.stop_streaming()
+                
+                if was_active:
+                    status = self._qwen_streaming_service.get_status()
+                    embed = discord.Embed(
+                        title="🛑 Qwen2.5-VL Streaming Stopped",
+                        color=discord.Color.red()
+                    )
+                    
+                    embed.add_field(
+                        name="📊 Session Summary",
+                        value=f"Total Frames: {status.get('frame_count', 0)}\n"
+                              f"Successful Analyses: {status.get('successful_analyses', 0)}\n"
+                              f"Failed Analyses: {status.get('failed_analyses', 0)}\n"
+                              f"Comprehensive Analyses: {status.get('comprehensive_analyses', 0)}",
+                        inline=True
+                    )
+                    
+                    if status.get('avg_analysis_time'):
+                        embed.add_field(
+                            name="⏱️ Performance",
+                            value=f"Avg Frame Analysis: {status.get('avg_analysis_time', 0):.2f}s\n"
+                                  f"Collection Duration: {status.get('collection_duration', 60)}s\n"
+                                  f"Frame Interval: {status.get('frame_interval', 10)}s",
+                            inline=True
+                        )
+                    
+                    await ctx.send(embed=embed)
+                else:
+                    await ctx.send("ℹ️ **No active Qwen2.5-VL streaming to stop.**")
+            else:
+                await ctx.send("ℹ️ **No Qwen2.5-VL streaming service initialized.**")
+                
+        except Exception as e:
+            self.logger.error(f"Video stream stop error: {e}")
+            await ctx.send(f"❌ **Failed to stop streaming**: {str(e)}")
+
+    async def _video_stream_status(self, ctx):
+        """Show Qwen2.5-VL streaming status"""
+        try:
+            embed = discord.Embed(
+                title="🎬 Qwen2.5-VL Streaming Status",
+                color=discord.Color.blue()
+            )
+            
+            # Check if streaming service exists and is active
+            if hasattr(self, '_qwen_streaming_service') and self._qwen_streaming_service:
+                is_active = self._qwen_streaming_service.is_active()
+                status = self._qwen_streaming_service.get_status()
+                
+                embed.add_field(
+                    name="🎬 Streaming Status",
+                    value="🟢 **ACTIVE**" if is_active else "🔴 **INACTIVE**",
+                    inline=True
+                )
+                
+                if is_active and status:
+                    embed.add_field(
+                        name="📊 Current Session",
+                        value=f"Total Frames: {status.get('frame_count', 0)}\n"
+                              f"Successful: {status.get('successful_analyses', 0)}\n"
+                              f"Failed: {status.get('failed_analyses', 0)}\n"
+                              f"Comprehensive: {status.get('comprehensive_analyses', 0)}",
+                        inline=True
+                    )
+                    
+                    if status.get('running_time'):
+                        embed.add_field(
+                            name="⏱️ Session Time",
+                            value=f"Running: {status.get('running_time', 0):.1f}s\n"
+                                  f"Collection: {status.get('collection_duration', 60)}s\n"
+                                  f"Interval: {status.get('frame_interval', 10)}s",
+                            inline=True
+                        )
+                    
+                    if status.get('avg_analysis_time'):
+                        embed.add_field(
+                            name="⚡ Performance",
+                            value=f"Avg Frame Analysis: {status.get('avg_analysis_time', 0):.2f}s\n"
+                                  f"Last Analysis: {status.get('last_analysis_time', 0):.2f}s",
+                            inline=False
+                        )
+            else:
+                embed.add_field(
+                    name="🎬 Streaming Status",
+                    value="🔴 **NOT INITIALIZED**",
+                    inline=True
+                )
+            
+            # OBS Connection Status
+            if hasattr(self, 'obs_service') and self.obs_service:
+                obs_info = self.obs_service.get_obs_info()
+                embed.add_field(
+                    name="📺 OBS Connection",
+                    value="✅ Connected" if obs_info.get('connected', False) else "❌ Disconnected",
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="📺 OBS Connection",
+                    value="❌ Not initialized",
+                    inline=True
+                )
+            
+            # CUDA Server Status
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("http://127.0.0.1:8083/health", timeout=5) as response:
+                        cuda_status = "✅ Available" if response.status == 200 else "❌ Unavailable"
+            except:
+                cuda_status = "❌ Unavailable"
+            
+            embed.add_field(
+                name="🚀 CUDA Server",
+                value=cuda_status,
+                inline=True
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Video stream status error: {e}")
+            await ctx.send(f"❌ **Failed to get streaming status**: {str(e)}")
+
     def get_configured_text_channel(self):
         """Get the configured text channel from settings."""
         try:
@@ -1990,6 +2940,8 @@ class DanzarVoiceBot(commands.Bot):
             return None
 
     async def setup_hook(self):
+        # Set the event loop for async operations
+        self.loop = asyncio.get_event_loop()
         """Setup hook called after login but before connecting to gateway."""
         self.logger.info("Loading Whisper and VAD models in setup_hook...")
         try:
@@ -2001,7 +2953,7 @@ class DanzarVoiceBot(commands.Bot):
                 self.use_omni_for_audio = True
             elif WHISPER_AVAILABLE and whisper:
                 # Use the configured model size from settings
-                model_size = self.settings.get('WHISPER_MODEL_SIZE', 'base.en')
+                model_size = self.settings.get('WHISPER_MODEL_SIZE', 'large')
                 self.whisper_model = await asyncio.get_running_loop().run_in_executor(
                     None, 
                     whisper.load_model, 
@@ -2082,7 +3034,7 @@ class DanzarVoiceBot(commands.Bot):
                     self.use_omni_for_audio = True
                 elif WHISPER_AVAILABLE and whisper:
                     # Use the configured model size from settings
-                    model_size = self.settings.get('WHISPER_MODEL_SIZE', 'base.en')
+                    model_size = self.settings.get('WHISPER_MODEL_SIZE', 'large')
                     self.whisper_model = await asyncio.get_running_loop().run_in_executor(
                         None, 
                         whisper.load_model, 
@@ -2108,1150 +3060,213 @@ class DanzarVoiceBot(commands.Bot):
         
         # Auto-join voice channel if configured
         await self._auto_join_voice_channel()
+        
+        # Start Discord connection monitoring
+        await self._start_connection_monitor()
+        
+        # Initialize virtual audio capture after voice connection
+        await self._initialize_virtual_audio_capture()
 
     async def _auto_join_voice_channel(self):
-        """Automatically join the configured voice channel on startup"""
+        """Automatically join the configured voice channel with improved stability."""
         try:
-            voice_channel_id = self.settings.get('DISCORD_VOICE_CHANNEL_ID')
+            # Get voice channel ID from settings
+            voice_channel_id = self.app_context.global_settings.get('DISCORD_VOICE_CHANNEL_ID')
             if not voice_channel_id:
-                self.logger.info("🔇 No voice channel configured for auto-join")
-                return
+                self.logger.warning("⚠️ No voice channel ID configured")
+                return False
             
             # Find the voice channel
             voice_channel = self.get_channel(int(voice_channel_id))
             if not voice_channel:
                 self.logger.error(f"❌ Voice channel {voice_channel_id} not found")
-                return
+                return False
             
-            if not hasattr(voice_channel, 'connect'):
-                self.logger.error(f"❌ Channel {voice_channel_id} is not a voice channel")
-                return
-            
-            self.logger.info(f"🎤 Auto-joining voice channel: {voice_channel.name}")
-            
-            # Connect to voice channel
-            voice_client = await voice_channel.connect()
-            self.logger.info(f"✅ Successfully connected to {voice_channel.name}")
-            
-            # Start Windows audio capture for STT
-            if not self.virtual_audio:
-                self.virtual_audio = WhisperAudioCapture(self.app_context, self.process_virtual_audio_sync)
-                
-                # Check if faster-whisper STT service is available
-                if hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service:
-                    self.logger.info("✅ Using faster-whisper for STT")
-                else:
-                    self.logger.warning("⚠️ faster-whisper STT service not available")
-
-            # Use the working VB-Audio device (device 8) to avoid DirectSound errors
-            working_device_id = 8  # CABLE Output (VB-Audio Virtual Cable) - confirmed working
-            device_selected = False
-            
-            try:
-                # Test if the working device is available
-                if VIRTUAL_AUDIO_AVAILABLE and sd:
-                    devices = sd.query_devices()
-                    if working_device_id < len(devices):
-                        device_info = sd.query_devices(working_device_id, 'input')
-                        if hasattr(device_info, 'name'):
-                            device_name = device_info.name
-                        elif isinstance(device_info, dict):
-                            device_name = device_info.get('name', f'Device {working_device_id}')
+            # Check if already connected
+            if self.voice_clients:
+                for vc in self.voice_clients:
+                    if vc.channel and vc.channel.id == voice_channel_id:
+                        if vc.is_connected():
+                            self.logger.info(f"Already connected to voice channel: {voice_channel.name}")
+                            return True
                         else:
-                            device_name = f'Device {working_device_id}'
-                        
-                        if self.virtual_audio.select_input_device(working_device_id):
-                            device_selected = True
-                            self.logger.info(f"🎯 Using working VB-Audio device: {device_name}")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Could not use working VB-Audio device 8: {e}")
-
-            # Fallback to auto-detection if working VB-Audio device 8 not available
-            if not device_selected and VIRTUAL_AUDIO_AVAILABLE and self.virtual_audio:
-                virtual_devices = self.virtual_audio.list_audio_devices()
-                if virtual_devices:
-                    # Use first available virtual audio device
-                    device_id = virtual_devices[0][0]
-                    if self.virtual_audio.select_input_device(device_id):
-                        device_selected = True
-                        device_name = virtual_devices[0][1]
-                        self.logger.info(f"🎯 Auto-selected virtual audio device: {device_name}")
-
-            # Start recording if device selected
-            if device_selected and self.virtual_audio.start_recording():
-                self.logger.info("✅ Windows audio capture started successfully")
-                
-                # Get configured text channel for status message
-                text_channel = self.get_configured_text_channel()
-                if text_channel:
-                    await text_channel.send(f"🤖 **DanzarAI Auto-Started**\n"
-                                          f"✅ **Connected to {voice_channel.name}**\n"
-                                          f"🎤 **Windows Audio Capture Active**\n"
-                                          f"🎯 **faster-whisper STT Ready**\n"
-                                          f"🔊 **Listening to VB-Audio Point**\n"
-                                          f"💬 **Speak and I'll respond in text and voice!**")
-            else:
-                self.logger.warning("⚠️ Failed to start Windows audio capture")
-                
-                # Get configured text channel for status message
-                text_channel = self.get_configured_text_channel()
-                if text_channel:
-                    await text_channel.send(f"⚠️ **DanzarAI Connected with Issues**\n"
-                                          f"✅ **Connected to {voice_channel.name}**\n"
-                                          f"❌ **Audio capture failed**\n"
-                                          f"🔧 **Install VB-Audio Point or check audio devices**\n"
-                                          f"💡 **Use `!virtual list` to see available devices**")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Auto-join failed: {e}")
-            
-            # Try to send error message to text channel
-            try:
-                text_channel = self.get_configured_text_channel()
-                if text_channel:
-                    await text_channel.send(f"❌ **DanzarAI Auto-Join Failed**\n"
-                                          f"Error: {str(e)}\n"
-                                          f"💡 **Use `!join` to manually connect**")
-            except:
-                pass  # Don't fail if we can't send the error message
-
-    async def on_command_error(self, context, exception):
-        """Handle command errors."""
-        if isinstance(exception, commands.CommandNotFound):
-            self.logger.warning(f"❓ Unknown command: {context.message.content}")
-            await context.send(f"❓ Unknown command. Available commands: `!join`, `!leave`, `!test`, `!status`")
-        else:
-            self.logger.error(f"❌ Command error: {exception}")
-            await context.send(f"❌ An error occurred: {str(exception)}")
-
-    # Raw voice recording is now handled by the RawAudioReceiver class
-    # No need for separate VAD recording method
-
-    def process_virtual_audio_sync(self, audio_data: np.ndarray):
-        """Process audio from Whisper audio capture - synchronous version for threading."""
-        try:
-            self.logger.info("🎵 Processing Whisper audio segment")
-            
-            # This method is called from the audio worker thread
-            # It should NOT make any async Discord API calls
-            # Instead, it puts results in the queue for the main Discord bot to process
-            
-            # The actual transcription is already handled in the worker thread
-            # This method is just a placeholder for compatibility
-            self.logger.info("🎯 Audio processing delegated to worker thread queue system")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error in virtual audio sync processing: {e}")
-
-    async def process_simple_discord_audio(self, audio_data: np.ndarray, user_name: str):
-        """Process audio from simple Discord voice capture."""
-        try:
-            self.logger.info(f"🎵 Processing simple Discord audio from {user_name}")
-            
-            # Get configured text channel
-            text_channel = self.get_configured_text_channel()
-            if not text_channel:
-                self.logger.warning("⚠️  No configured text channel available for Discord audio responses")
-                return
-            
-            # Process the audio segment with the existing pipeline
-            await self.process_speech_segment(audio_data, text_channel, user_name)
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error processing simple Discord audio: {e}")
-
-    async def process_vad_transcription(self, dummy_audio: np.ndarray, user_name: str, transcription: str):
-        """Process transcription from VAD voice receiver with full LLM/RAG integration."""
-        try:
-            self.logger.info(f"🎯 Processing VAD transcription from {user_name}: '{transcription}'")
-            
-            # ===== ENHANCED FEEDBACK PREVENTION CHECK =====
-            # Check if we should ignore this input due to TTS playback
-            should_ignore, ignore_reason = self.feedback_prevention.should_ignore_input()
-            if should_ignore:
-                self.logger.info(f"🛡️ Ignoring input due to feedback prevention: {ignore_reason}")
-                return
-            
-            # Check if this transcription is likely an echo of our own TTS
-            is_echo, echo_reason = self.feedback_prevention.is_likely_tts_echo(transcription)
-            if is_echo:
-                self.logger.info(f"🛡️ Detected TTS echo, ignoring: {echo_reason}")
-                return
-            
-            # Additional filtering for background noise and meaningless audio
-            transcription_clean = transcription.lower().strip()
-            
-            # Filter out very short or meaningless transcriptions
-            if len(transcription_clean) < 3:
-                self.logger.info(f"🛡️ Ignoring very short transcription: '{transcription}'")
-                return
-            
-            # Filter out common background noise transcriptions
-            noise_patterns = [
-                "um", "uh", "ah", "oh", "mm", "hmm", "hm", "eh", "er",
-                "the", "a", "an", "and", "or", "but", "so", "well",
-                "music", "sound", "audio", "noise", "background"
-            ]
-            
-            if transcription_clean in noise_patterns:
-                self.logger.info(f"🛡️ Ignoring background noise pattern: '{transcription}'")
-                return
-            
-            # Filter out repetitive patterns (likely audio artifacts)
-            words = transcription_clean.split()
-            if len(words) >= 2:
-                # Check for word repetition
-                unique_words = set(words)
-                if len(unique_words) == 1:  # All words are the same
-                    self.logger.info(f"🛡️ Ignoring repetitive transcription: '{transcription}'")
-                    return
-            
-            # Only process transcriptions that seem like actual meaningful speech
-            # Require at least 5 characters and not just common filler words
-            if len(transcription_clean) < 5:
-                self.logger.info(f"🛡️ Ignoring too short transcription: '{transcription}'")
-                return
-            
-            # Clean up old feedback prevention entries
-            self.feedback_prevention.cleanup_old_entries()
-            
-            # Add user input to short-term memory
-            if self.app_context.short_term_memory_service:
-                self.app_context.short_term_memory_service.add_entry(
-                    user_name=user_name,
-                    content=transcription,
-                    entry_type='user_input'
-                )
-                self.logger.debug(f"[ShortTermMemory] Stored user input: '{transcription[:50]}...'")
-            
-            # Get configured text channel
-            text_channel = self.get_configured_text_channel()
-            if not text_channel:
-                self.logger.warning("⚠️  No configured text channel available for VAD responses")
-                return
-            
-            # Send transcription to channel
-            await text_channel.send(f"🎤 **{user_name}**: {transcription}")
-            
-            # Process with full LLM/RAG pipeline
-            if self.llm_service:
-                try:
-                    self.logger.info(f"🧠 Processing with full LLM/RAG pipeline...")
-                    
-                    # Check if LLM-guided search mode is enabled
-                    if getattr(self, 'llm_search_mode', False):
-                        self.logger.info("🔍 Using LLM-guided search mode")
-                        response = await self.llm_service.handle_user_text_query_with_llm_search(
-                            user_text=transcription,
-                            user_name=user_name
-                        )
-                        # Extract response text if it's a tuple
-                        if isinstance(response, tuple):
-                            response_text, metadata = response
-                            self.logger.info(f"🔍 LLM search method: {metadata.get('method', 'unknown')}")
-                            response = response_text
-                    else:
-                        # Use the existing LLM service's comprehensive text processing
-                        response = await self.llm_service.handle_user_text_query(
-                            user_text=transcription,
-                            user_name=user_name
-                        )
-                    
-                    if response and len(response.strip()) > 0:
-                        # Strip think tags from LLM response
-                        clean_response = self._strip_think_tags(response)
-                        
-                        # Send LLM response
-                        await text_channel.send(f"🤖 **Danzar**: {clean_response}")
-                        
-                        # Add bot response to short-term memory (use clean response)
-                        if self.app_context.short_term_memory_service:
-                            self.app_context.short_term_memory_service.add_entry(
-                                user_name=user_name,
-                                content=clean_response,
-                                entry_type='bot_response'
-                            )
-                            self.logger.debug(f"[ShortTermMemory] Stored bot response: '{clean_response[:50]}...'")
-                        
-                        # Generate TTS if available (use clean response)
-                        if self.tts_service:
+                            # Disconnect from broken connection
                             try:
-                                self.logger.info("🔊 Generating TTS response...")
-                                tts_text = self._strip_markdown_for_tts(clean_response)
-                                
-                                # ===== START FEEDBACK PREVENTION =====
-                                self.feedback_prevention.start_tts_playback(tts_text)
-                                
-                                # Generate TTS audio asynchronously
-                                loop = asyncio.get_event_loop()
-                                tts_audio = await loop.run_in_executor(
-                                    None,
-                                    self.tts_service.generate_audio,
-                                    tts_text
-                                )
-                                
-                                if tts_audio:
-                                    self.logger.info("✅ TTS audio generated successfully")
-                                    await self._play_tts_audio_with_feedback_prevention(tts_audio)
-                                else:
-                                    self.logger.warning("⚠️ TTS generation failed")
-                                    self.feedback_prevention.stop_tts_playback()
-                                    
-                            except Exception as tts_e:
-                                self.logger.error(f"❌ TTS error: {tts_e}")
-                                # Stop feedback prevention on error
-                                self.feedback_prevention.stop_tts_playback()
-                    else:
-                        await text_channel.send("🤖 **DanzarAI**: I heard you, but I'm not sure how to respond to that.")
-                        
-                except Exception as e:
-                    self.logger.error(f"❌ LLM processing error: {e}")
-                    await text_channel.send("🤖 **DanzarAI**: Sorry, I had trouble processing that.")
-            else:
-                # Fallback response if LLM not available
-                response = f"Hello {user_name}! I heard you say: '{transcription}'. My LLM service isn't available right now."
-                await text_channel.send(f"🤖 **DanzarAI**: {response}")
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error processing VAD transcription: {e}")
-
-    async def process_offline_voice_response(self, transcription: str, response: str, audio_file: str, user_name: str):
-        """Process complete offline voice response (STT → LLM → TTS)."""
-        try:
-            self.logger.info(f"🎯 Processing offline voice response from {user_name}")
+                                await vc.disconnect(force=True)
+                                await asyncio.sleep(2)
+                            except:
+                                pass
             
-            # Get configured text channel
-            text_channel = self.get_configured_text_channel()
-            if not text_channel:
-                self.logger.warning("⚠️  No configured text channel available for offline responses")
-                return
+            # Check for existing voice connections in the target channel
+            existing_connections = []
+            for member in voice_channel.members:
+                if member.voice and member.voice.channel:
+                    existing_connections.append({
+                        'user_name': member.display_name,
+                        'user_id': member.id,
+                        'session_id': getattr(member.voice, 'session_id', 'unknown')
+                    })
             
-            # Send transcription and response to channel
-            await text_channel.send(f"🎤 **{user_name}**: {transcription}")
-            await text_channel.send(f"🤖 **DanzarAI (Offline)**: {response}")
+            if existing_connections:
+                self.logger.info(f"Found {len(existing_connections)} existing voice connections in {voice_channel.name}:")
+                for conn in existing_connections:
+                    self.logger.info(f"  - {conn['user_name']} (ID: {conn['user_id']}, Session: {conn['session_id']})")
             
-            # Play TTS audio in voice channel if available
-            if audio_file:
+            # Attempt connection with improved error handling
+            max_retries = 5
+            base_delay = 2
+            
+            for attempt in range(max_retries):
                 try:
-                    # Find voice connection
-                    voice_client = None
-                    for guild in self.guilds:
-                        if guild.voice_client:
-                            voice_client = guild.voice_client
-                            break
+                    self.logger.info(f"Attempting to join voice channel: {voice_channel.name} (Attempt {attempt + 1}/{max_retries})")
                     
-                    if voice_client and voice_client.is_connected():
-                        # Play the generated audio
-                        audio_source = discord.FFmpegPCMAudio(audio_file)
-                        voice_client.play(audio_source)
-                        
-                        # Wait for playback to finish
-                        while voice_client.is_playing():
-                            await asyncio.sleep(0.1)
-                        
-                        self.logger.info("🔊 Offline TTS audio played successfully")
-                        
-                        # Clean up temporary file
+                    # Disconnect from any existing connections first
+                    for vc in self.voice_clients:
                         try:
-                            os.unlink(audio_file)
+                            await vc.disconnect(force=True)
+                            await asyncio.sleep(1)
                         except:
                             pass
+                    
+                    # Connect with minimal parameters and proper timeout
+                    voice_client = await asyncio.wait_for(
+                        voice_channel.connect(timeout=30.0),
+                        timeout=35.0
+                    )
+                    
+                    # Wait for connection to stabilize
+                    await asyncio.sleep(3)
+                    
+                    if voice_client and voice_client.is_connected():
+                        self.logger.info(f"✅ Successfully connected to voice channel: {voice_channel.name}")
+                        return True
                     else:
-                        self.logger.warning("⚠️  No voice connection for TTS playback")
+                        self.logger.warning(f"Voice client connected but not ready (Attempt {attempt + 1})")
+                        
+                except asyncio.TimeoutError:
+                    self.logger.error(f"❌ Voice connection timeout (Attempt {attempt + 1})")
+                except discord.ClientException as e:
+                    if "Already connected" in str(e):
+                        self.logger.warning("⚠️ Already connected, disconnecting first...")
+                        for vc in self.voice_clients:
+                            await vc.disconnect(force=True)
+                        await asyncio.sleep(3)
+                        continue
+                    else:
+                        self.logger.error(f"❌ ClientException (Attempt {attempt + 1}): {e}")
+                except discord.HTTPException as e:
+                    if e.status == 4006:
+                        self.logger.warning(f"⚠️ WebSocket 4006 error (Attempt {attempt + 1}) - Session expired")
+                        # For 4006 errors, wait longer and try to refresh the connection
+                        await asyncio.sleep(10)
+                        
+                        # Try to refresh the Discord connection
+                        try:
+                            await self.close()
+                            await asyncio.sleep(5)
+                            await self.start(self.app_context.global_settings.get('DISCORD_BOT_TOKEN'))
+                            await asyncio.sleep(3)
+                        except Exception as refresh_error:
+                            self.logger.error(f"Failed to refresh Discord connection: {refresh_error}")
+                    else:
+                        self.logger.error(f"❌ HTTPException (Attempt {attempt + 1}): {e}")
+                except Exception as e:
+                    self.logger.error(f"❌ Unexpected error (Attempt {attempt + 1}): {e}")
+                
+                if attempt < max_retries - 1:
+                    delay = min(base_delay * (2 ** attempt), 30)  # Exponential backoff with cap
+                    self.logger.info(f"⏳ Waiting {delay} seconds before retry...")
+                    await asyncio.sleep(delay)
+            
+            self.logger.error(f"Failed to connect to voice channel after {max_retries} attempts")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in _auto_join_voice_channel: {e}")
+            return False
+
+    async def _check_discord_connection_health(self):
+        """Monitor Discord connection health and reconnect if needed."""
+        try:
+            # Check if we have any voice clients
+            if not self.voice_clients:
+                self.logger.warning("⚠️ No voice clients found, attempting to reconnect...")
+                await self._auto_join_voice_channel()
+                return
+            
+            # Check each voice client
+            for vc in self.voice_clients:
+                if not vc.is_connected():
+                    self.logger.warning(f"⚠️ Voice client disconnected from {vc.channel.name if vc.channel else 'Unknown'}")
+                    try:
+                        await vc.disconnect(force=True)
+                    except:
+                        pass
+                    continue
+                
+                # Check websocket health
+                try:
+                    # Check if websocket exists and is connected
+                    if hasattr(vc, 'ws') and vc.ws:
+                        # Check the actual websocket connection
+                        if hasattr(vc.ws, 'ws') and vc.ws.ws:
+                            # Check if the websocket is closed
+                            if hasattr(vc.ws.ws, 'closed') and vc.ws.ws.closed:
+                                self.logger.warning(f"⚠️ Voice WebSocket closed for {vc.channel.name if vc.channel else 'Unknown'}")
+                                try:
+                                    await vc.disconnect(force=True)
+                                except:
+                                    pass
+                                continue
+                        else:
+                            self.logger.warning(f"⚠️ Voice WebSocket not available for {vc.channel.name if vc.channel else 'Unknown'}")
+                            try:
+                                await vc.disconnect(force=True)
+                            except:
+                                pass
+                            continue
+                    else:
+                        self.logger.warning(f"⚠️ No WebSocket found for {vc.channel.name if vc.channel else 'Unknown'}")
+                        try:
+                            await vc.disconnect(force=True)
+                        except:
+                            pass
+                        continue
                         
                 except Exception as e:
-                    self.logger.error(f"❌ Error playing offline TTS: {e}")
-                    
-        except Exception as e:
-            self.logger.error(f"❌ Error processing offline voice response: {e}")
-    
-    async def _on_realtime_transcription(self, transcription: str, user_id: int):
-        """Callback for real-time transcription events"""
-        try:
-            # Get user name from Discord
-            user = self.get_user(user_id)
-            user_name = user.display_name if user else f"User {user_id}"
-            
-            # Get configured text channel
-            text_channel = self.get_configured_text_channel()
-            if text_channel:
-                await text_channel.send(f"🎤 **{user_name}**: {transcription}")
-                
-            self.logger.info(f"⚡ [RealTime] Transcription: '{transcription}' from {user_name}")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Real-time transcription callback error: {e}")
-    
-    async def _on_realtime_response(self, response: str, user_id: int):
-        """Callback for real-time response events"""
-        try:
-            # Get user name from Discord
-            user = self.get_user(user_id)
-            user_name = user.display_name if user else f"User {user_id}"
-            
-            # Get configured text channel
-            text_channel = self.get_configured_text_channel()
-            if text_channel:
-                await text_channel.send(f"🤖 **Danzar**: {response}")
-                
-            self.logger.info(f"⚡ [RealTime] Response: '{response[:50]}...' to {user_name}")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Real-time response callback error: {e}")
-
-    async def _preprocess_discord_audio(self, audio_data: np.ndarray) -> Optional[np.ndarray]:
-        """Enhanced preprocessing specifically for Discord's compressed audio."""
-        try:
-            # Basic validation
-            if len(audio_data) == 0:
-                return None
-            
-            # Calculate audio metrics
-            audio_duration = len(audio_data) / 48000  # Discord uses 48kHz
-            audio_max_volume = np.max(np.abs(audio_data))
-            audio_rms = np.sqrt(np.mean(np.square(audio_data)))
-            
-            self.logger.info(f"🎵 Audio preprocessing - Duration: {audio_duration:.2f}s, Max: {audio_max_volume:.4f}, RMS: {audio_rms:.4f}")
-            
-            # More lenient quality checks for Discord
-            if audio_max_volume < 0.005:  # Very low threshold
-                self.logger.warning(f"🔇 Audio volume too low (max: {audio_max_volume:.4f})")
-                return None
-            
-            if audio_duration < 0.3:  # Minimum duration
-                self.logger.warning(f"🔇 Audio too short ({audio_duration:.2f}s)")
-                return None
-            
-            # Enhanced Discord audio processing
-            processed_audio = audio_data.copy()
-            
-            try:
-                # Import scipy for advanced processing
-                from scipy import signal
-                
-                # 1. Remove DC offset (common in Discord audio)
-                processed_audio = processed_audio - np.mean(processed_audio)
-                
-                # 2. Gentler noise gate for Discord's background noise
-                noise_threshold = audio_rms * 0.15  # Less aggressive threshold
-                processed_audio = np.where(
-                    np.abs(processed_audio) < noise_threshold,
-                    processed_audio * 0.3,  # Reduce noise by 70% (less aggressive)
-                    processed_audio
-                )
-                
-                # 3. Pre-emphasis filter to counteract Discord's compression
-                pre_emphasis = 0.97
-                emphasized = np.append(processed_audio[0], processed_audio[1:] - pre_emphasis * processed_audio[:-1])
-                
-                # 4. Band-pass filter optimized for speech (300-3400 Hz)
-                try:
-                    sos = signal.butter(4, [300, 3400], 'bp', fs=48000, output='sos')
-                    filtered_audio = signal.sosfilt(sos, emphasized)
-                    processed_audio = np.asarray(filtered_audio, dtype=np.float32)
-                except Exception as filter_error:
-                    self.logger.warning(f"⚠️ Filter error, using emphasized audio: {filter_error}")
-                    processed_audio = emphasized.astype(np.float32)
-                
-                # 5. Gentler dynamic range compression
-                # Lighter compression to avoid artifacts
-                threshold = 0.5  # Higher threshold
-                ratio = 2.0      # Lower ratio (less compression)
-                above_threshold = np.abs(processed_audio) > threshold
-                compressed = processed_audio.copy()
-                compressed[above_threshold] = np.sign(processed_audio[above_threshold]) * (
-                    threshold + (np.abs(processed_audio[above_threshold]) - threshold) / ratio
-                )
-                processed_audio = compressed
-                
-                # 6. Normalize to optimal level for STT
-                if np.max(np.abs(processed_audio)) > 0:
-                    processed_audio = processed_audio * (0.7 / np.max(np.abs(processed_audio)))
-                
-                # 7. Convert sample rate to 16kHz for STT (if needed)
-                if len(processed_audio) > 0:
-                    # Simple downsampling from 48kHz to 16kHz
-                    target_length = int(len(processed_audio) * 16000 / 48000)
-                    if target_length > 0:
-                        downsampled = np.interp(
-                            np.linspace(0, len(processed_audio), target_length),
-                            np.arange(len(processed_audio)),
-                            processed_audio
-                        )
-                        processed_audio = downsampled.astype(np.float32)
-                
-                final_rms = np.sqrt(np.mean(np.square(processed_audio)))
-                self.logger.info(f"🎵 Audio enhanced - Original RMS: {audio_rms:.4f}, Final RMS: {final_rms:.4f}, Gain: {final_rms/audio_rms:.2f}x")
-                
-            except ImportError:
-                self.logger.warning("⚠️ scipy not available, using basic processing")
-                # Basic processing without scipy
-                processed_audio = audio_data - np.mean(audio_data)  # Remove DC offset
-                if np.max(np.abs(processed_audio)) > 0:
-                    processed_audio = processed_audio * (0.7 / np.max(np.abs(processed_audio)))
-                
-                # Simple downsampling to 16kHz
-                target_length = int(len(processed_audio) * 16000 / 48000)
-                if target_length > 0:
-                    processed_audio = np.interp(
-                        np.linspace(0, len(processed_audio), target_length),
-                        np.arange(len(processed_audio)),
-                        processed_audio
-                    )
-            
-            return processed_audio
-            
-        except Exception as e:
-            self.logger.error(f"❌ Audio preprocessing error: {e}")
-            return audio_data  # Return original if preprocessing fails
-
-    async def process_speech_segment(self, audio_data: np.ndarray, text_channel: discord.TextChannel, user_name: str):
-        """Process a complete speech segment with STT → LLM → TTS pipeline."""
-        try:
-            self.logger.info(f"🎤 Processing speech segment from {user_name}")
-            self.logger.info(f"🎵 Audio segment details: shape={audio_data.shape}, max_vol={np.max(np.abs(audio_data)):.4f}")
-            
-            # Step 1: STT - Convert speech to text
-            self.logger.info(f"🎵 Starting transcription for {user_name}...")
-            transcription = await self.transcribe_audio(audio_data)
-            self.logger.info(f"🎵 Transcription completed for {user_name}: {transcription}")
-            
-            if transcription and len(transcription.strip()) > 0:
-                self.logger.info(f"📝 Transcription from {user_name}: {transcription}")
-                
-                # Send transcription to channel
-                await text_channel.send(f"🎤 **{user_name}**: {transcription}")
-                
-                # Step 2: LLM - Process with LLM service (simplified to avoid timeout issues)
-                if self.llm_service:
+                    self.logger.error(f"❌ Error checking WebSocket health: {e}")
                     try:
-                        self.logger.info(f"🧠 Processing with LLM...")
-                        
-                        # Use a simple fallback response to avoid complex async issues
-                        response = f"Hello {user_name}! I heard you say: '{transcription}'. I'm DanzarAI and I'm ready to help with your gaming!"
-                        
-                        # Send text response to channel
-                        await text_channel.send(f"🤖 **DanzarAI**: {response}")
-                        
-                        # Skip TTS for now to avoid additional complexity
-                        self.logger.info("🔊 TTS temporarily disabled for stability")
-                            
-                    except Exception as e:
-                        self.logger.error(f"❌ LLM processing error: {e}")
-                        await text_channel.send("🤖 **DanzarAI**: Sorry, I had trouble processing that.")
-                else:
-                    # Fallback response if LLM not available
-                    response = f"Hello {user_name}! I heard you say: '{transcription}'. I'm DanzarAI and I'm ready to help with your gaming!"
-                    await text_channel.send(f"🤖 **DanzarAI**: {response}")
-                    
-            else:
-                self.logger.info(f"🔇 No clear speech detected from {user_name}")
+                        await vc.disconnect(force=True)
+                    except:
+                        pass
+                    continue
+                
+                # If we get here, the connection is healthy
+                self.logger.debug(f"✅ Voice connection healthy for {vc.channel.name if vc.channel else 'Unknown'}")
                 
         except Exception as e:
-            self.logger.error(f"❌ Error processing speech segment: {e}", exc_info=True)
+            self.logger.error(f"❌ Error in connection health check: {e}")
 
-    async def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio data using available STT service."""
+    async def _start_connection_monitor(self):
+        """Start Discord connection monitoring"""
         try:
-            # Enhanced Discord audio preprocessing
-            processed_audio = await self._preprocess_discord_audio(audio_data)
-            if processed_audio is None:
-                return None
+            self.logger.info("🔍 Starting Discord connection monitor...")
             
-            # Check if LlamaCpp Qwen can handle audio directly
-            llamacpp_config = self.app_context.global_settings.get('LLAMACPP_QWEN', {})
-            if (llamacpp_config.get('enabled') and llamacpp_config.get('use_for_audio') and
-                hasattr(self.app_context, 'llamacpp_qwen_service') and self.app_context.llamacpp_qwen_service):
-                return await self._transcribe_with_llamacpp(processed_audio)
-            
-            # Fallback to Qwen2.5-Omni if enabled
-            elif (hasattr(self, 'use_omni_for_audio') and self.use_omni_for_audio and
-                hasattr(self.app_context, 'qwen_omni_service') and self.app_context.qwen_omni_service):
-                return await self._transcribe_with_omni(processed_audio)
-            
-            # Use faster-whisper STT service
-            if (hasattr(self.app_context, 'faster_whisper_stt_service') and 
-                self.app_context.faster_whisper_stt_service):
-                
-                self.logger.info("🎯 Using faster-whisper for transcription...")
-                result = self.app_context.faster_whisper_stt_service.transcribe_audio_data(processed_audio)
-                
-                if result and len(result.strip()) > 0:
-                    self.logger.info(f"✅ faster-whisper transcription: '{result}'")
-                    return result
-                else:
-                    self.logger.info("🔇 faster-whisper returned no result")
-                    return None
-            else:
-                self.logger.error("❌ No STT service available")
-                return None
-            
-        except Exception as e:
-            self.logger.error(f"❌ Transcription error: {e}")
-            return None
-    
-    async def _transcribe_with_whisper(self, audio_data: np.ndarray) -> Optional[str]:
-        """Fallback transcription using Whisper."""
-        if not self.whisper_model:
-            self.logger.error("❌ Whisper model not loaded")
-            return None
-            
-        try:
-            # Debug audio data
-            self.logger.info(f"🎵 Audio data shape: {audio_data.shape}, duration: {len(audio_data)/16000:.2f}s, max: {np.max(np.abs(audio_data)):.4f}")
-            
-            # Enhanced audio validation
-            audio_duration = len(audio_data) / 16000
-            audio_max_volume = np.max(np.abs(audio_data))
-            audio_rms = np.sqrt(np.mean(np.square(audio_data)))
-            
-            self.logger.info(f"🎵 Audio stats - Duration: {audio_duration:.2f}s, Max: {audio_max_volume:.4f}, RMS: {audio_rms:.4f}")
-            
-            # More lenient audio quality checks - focus on fixing the actual audio processing
-            if audio_max_volume < 0.01:  # Lowered back down - the issue isn't volume
-                self.logger.warning(f"🔇 Audio volume too low (max: {audio_max_volume:.4f}), skipping transcription")
-                return None
-            
-            if audio_rms < 0.003:  # Lowered back down - need to process more audio to debug
-                self.logger.warning(f"🔇 Audio RMS too low ({audio_rms:.4f}), likely background noise")
-                return None
-            
-            # Log audio quality metrics for debugging
-            signal_to_noise = audio_max_volume / (audio_rms + 1e-8)
-            self.logger.info(f"🎵 Audio quality - SNR: {signal_to_noise:.2f}, Duration: {audio_duration:.2f}s")
-            
-            # Check if audio is long enough (very lenient now)
-            if audio_duration < 0.2:  # Lowered to 0.2 seconds - very permissive
-                self.logger.warning(f"🔇 Audio too short ({audio_duration:.2f}s), skipping transcription")
-                return None
-            
-            # Normalize audio to prevent clipping and improve recognition
-            if audio_max_volume > 0:
-                # Normalize to 70% of max range to prevent clipping
-                normalized_audio = audio_data * (0.7 / audio_max_volume)
-                self.logger.info(f"🎵 Audio normalized from max {audio_max_volume:.4f} to {np.max(np.abs(normalized_audio)):.4f}")
-            else:
-                normalized_audio = audio_data
-            
-            # Aggressive Discord audio preprocessing (based on Discord Audio Fixer research)
-            try:
-                from scipy import signal
-                
-                # 1. Aggressive pre-emphasis to counteract Discord's audio compression
-                pre_emphasis = 0.95  # More aggressive than standard 0.97
-                emphasized_audio = np.append(normalized_audio[0], normalized_audio[1:] - pre_emphasis * normalized_audio[:-1])
-                
-                # 2. Remove DC offset that Discord often introduces
-                emphasized_audio = emphasized_audio - np.mean(emphasized_audio)
-                
-                # 3. Wider band-pass filter for Discord's compressed audio (200-4000 Hz)
-                sos_bp = signal.butter(3, [200, 4000], 'bp', fs=16000, output='sos')
-                filtered_result = signal.sosfilt(sos_bp, emphasized_audio)
-                filtered_audio = np.asarray(filtered_result, dtype=np.float32)
-                
-                # 4. Spectral subtraction to reduce Discord's background noise
-                # Simple approach: reduce quiet sections more aggressively
-                rms_threshold = np.sqrt(np.mean(np.square(filtered_audio))) * 0.1
-                filtered_audio_abs = np.abs(filtered_audio)
-                noise_reduced = np.where(
-                    filtered_audio_abs < rms_threshold,
-                    filtered_audio * 0.1,  # Reduce noise by 90%
-                    filtered_audio
-                )
-                
-                # 5. Adaptive gain control for Discord's variable levels
-                # Calculate RMS in sliding windows
-                window_size = 1600  # 100ms windows
-                adaptive_audio = noise_reduced.copy()
-                for i in range(0, len(noise_reduced) - window_size, window_size // 2):
-                    window = np.array(noise_reduced[i:i + window_size])  # Ensure it's a numpy array
-                    window_rms = np.sqrt(np.mean(np.square(window)))
-                    if window_rms > 0.01:  # Only adjust if there's significant signal
-                        target_rms = 0.15
-                        gain = target_rms / window_rms
-                        gain = float(np.clip(gain, 0.5, 3.0))  # Ensure gain is a scalar
-                        adaptive_audio[i:i + window_size] = window * gain
-                
-                # 6. Final normalization optimized for Whisper
-                if np.max(np.abs(adaptive_audio)) > 0:
-                    # Normalize to 80% to leave headroom for Whisper
-                    final_audio = adaptive_audio * (0.8 / np.max(np.abs(adaptive_audio)))
-                else:
-                    final_audio = adaptive_audio
-                
-                # 7. Add very light dithering to break up quantization
-                dither = np.random.normal(0, 0.00005, len(final_audio))
-                final_audio = final_audio + dither
-                
-                original_rms = np.sqrt(np.mean(np.square(normalized_audio)))
-                final_rms = np.sqrt(np.mean(np.square(final_audio)))
-                self.logger.info(f"🎵 Discord audio fix applied - Original RMS: {original_rms:.4f}, Final RMS: {final_rms:.4f}, Gain: {final_rms/original_rms:.2f}x")
-                
-            except ImportError:
-                self.logger.warning("🔇 scipy not available, using basic processing")
-                final_audio = normalized_audio
-            
-            # Save audio to temporary file for Whisper
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                # Convert numpy array to WAV format
-                import scipy.io.wavfile as wavfile
-                # Ensure audio is in the right format for Whisper (16-bit PCM)
-                audio_int16 = np.clip(final_audio * 32767, -32767, 32767).astype(np.int16)
-                wavfile.write(temp_file.name, 16000, audio_int16)
-                temp_file_path = temp_file.name
-            
-            self.logger.info(f"🎵 Saved processed audio to {temp_file_path}, starting Whisper transcription...")
-            
-            # Run Whisper with ultra-conservative parameters to minimize Discord hallucinations
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: self.whisper_model.transcribe( # type: ignore
-                    temp_file_path,
-                    language='en',  # Force English
-                    task='transcribe',
-                    temperature=0.0,  # Deterministic
-                    best_of=1,  # Single beam to reduce hallucinations
-                    beam_size=1,  # No beam search to prevent repetition
-                    word_timestamps=False,  # Disable for speed
-                    condition_on_previous_text=False,  # No context to prevent bias
-                    initial_prompt="",  # Empty prompt to avoid hallucinations
-                    suppress_tokens=[-1],  # Suppress hallucination tokens
-                    logprob_threshold=-0.3,  # Even more aggressive filtering
-                    no_speech_threshold=0.9,  # Very high threshold
-                    compression_ratio_threshold=1.5  # Detect repetitive text more aggressively
-                )
-            )
-            
-            # Clean up temporary file
-            os.unlink(temp_file_path)
-            
-            if result and "text" in result:
-                text = str(result["text"]).strip()
-                # Log more detailed results
-                segments = result.get("segments", [])
-                avg_logprob = result.get("avg_logprob", "unknown")
-                no_speech_prob = result.get("no_speech_prob", "unknown")
-                
-                self.logger.info(f"📝 Whisper result: '{text}'")
-                self.logger.info(f"📊 Whisper stats - Segments: {len(segments)}, Avg LogProb: {avg_logprob}, No Speech Prob: {no_speech_prob}")
-                
-                # Check confidence metrics to reject hallucinations
-                if isinstance(avg_logprob, (int, float)) and avg_logprob < -0.8:
-                    self.logger.info(f"🚫 Rejected low confidence transcription (logprob: {avg_logprob})")
-                    return None
-                
-                if isinstance(no_speech_prob, (int, float)) and no_speech_prob > 0.6:
-                    self.logger.info(f"🚫 Rejected high no-speech probability ({no_speech_prob})")
-                    return None
-                
-                # Enhanced hallucination filtering with detailed logging
-                if text and len(text.strip()) > 0:
-                    text_lower = text.lower().strip()
-                    self.logger.info(f"🔍 Analyzing transcription: '{text}' (length: {len(text_lower)})")
-                    
-                    # Comprehensive Discord hallucination patterns (based on observed behavior)
-                    obvious_hallucinations = [
-                        "and a lot of people are watching this video",
-                        "a lot of people are watching this video", 
-                        "people are watching this video",
-                        "watching this video",
-                        "thank you for watching",
-                        "thanks for watching",
-                        "thank you so much for watching",
-                        "subscribe",
-                        "like and subscribe",
-                        "thank you",
-                        "you",
-                        "booooo",
-                        "oh",
-                        "um", 
-                        "uh",
-                        "i'm sorry",
-                        "sorry",
-                        "1 2 3",
-                        "one two three",
-                        "testing",
-                        "test",
-                        "yes yes",
-                        "no no",
-                        "!!!!",  # Discord audio artifact
-                        "!!!",   # Discord audio artifact
-                        "????",  # Discord audio artifact
-                        "...",   # Discord audio artifact
-                        "---",   # Discord audio artifact
-                        # Whisper hallucination patterns
-                        "the human speech is not a human speech",
-                        "human speech is not a human speech",
-                        "this is clear human speech",
-                        "you can't be a human being"
-                    ]
-                    
-                    # Check for character-level repetition (AAAA pattern)
-                    if len(text) > 10:
-                        char_counts = {}
-                        for char in text_lower:
-                            if char.isalpha():  # Only count letters
-                                char_counts[char] = char_counts.get(char, 0) + 1
-                        
-                        if char_counts:
-                            max_char_count = max(char_counts.values())
-                            char_repetition_ratio = max_char_count / len([c for c in text_lower if c.isalpha()])
-                            
-                            if char_repetition_ratio > 0.7:  # 70% of characters are the same
-                                most_repeated_char = max(char_counts.keys(), key=lambda k: char_counts[k])
-                                self.logger.info(f"🚫 Filtered out character repetition hallucination: '{most_repeated_char}' appears {max_char_count} times ({char_repetition_ratio:.1%})")
-                                return None
-                    
-                    # Check for word-level repetitive patterns (major hallucination indicator)
-                    words = text_lower.split()
-                    if len(words) >= 2:  # Check even 2-word transcriptions
-                        # Check for excessive repetition
-                        word_counts = {}
-                        for word in words:
-                            word_counts[word] = word_counts.get(word, 0) + 1
-                        
-                        # Special case: exact word repetition (like "hello hello")
-                        if len(words) == 2 and words[0] == words[1]:
-                            self.logger.info(f"🚫 Filtered out exact word repetition: '{text}'")
-                            return None
-                        
-                        # If any word appears more than 30% of the time, it's likely a hallucination
-                        max_word_count = max(word_counts.values()) if word_counts else 0
-                        repetition_ratio = max_word_count / len(words) if words else 0
-                        
-                        if repetition_ratio > 0.3:  # 30% threshold
-                            most_repeated_word = max(word_counts.keys(), key=lambda k: word_counts[k])
-                            self.logger.info(f"🚫 Filtered out repetitive hallucination: '{most_repeated_word}' appears {max_word_count}/{len(words)} times ({repetition_ratio:.1%})")
-                            return None
-                    
-                    # Check for specific Discord audio hallucination patterns
-                    discord_hallucinations = [
-                        "sound of the sound",
-                        "and the sound of",
-                        "the sound of the",
-                        "sound of sound",
-                        "and sound of"
-                    ]
-                    
-                    for pattern in discord_hallucinations:
-                        if pattern in text_lower:
-                            self.logger.info(f"🚫 Filtered out Discord audio hallucination pattern: '{pattern}'")
-                            return None
-                    
-
-                    
-                    # Check for exact matches only
-                    if text_lower in obvious_hallucinations:
-                        self.logger.info(f"🚫 Filtered out exact hallucination match: '{text}'")
-                        return None
-                    
-                    # Check for partial matches only for very specific phrases
-                    hallucination_patterns = [
-                        "watching this video", 
-                        "thank you for watching", 
-                        "human speech is not", 
-                        "the human speech",
-                        "human speech is",
-                        "speech is not",
-                        "not a human speech"
-                    ]
-                    
-                    for pattern in hallucination_patterns:
-                        if pattern in text_lower:
-                            self.logger.info(f"🚫 Filtered out partial hallucination match: '{text}' (contains '{pattern}')")
-                            return None
-                    
-                    # Only filter extremely short responses (1-2 characters)
-                    if len(text_lower) <= 2:
-                        self.logger.info(f"🚫 Filtered out very short text: '{text}'")
-                        return None
-                    
-                    # Accept everything else for now to debug
-                    self.logger.info(f"✅ Accepted transcription: '{text}'")
-                    return text
-                else:
-                    self.logger.info("🔇 Whisper returned empty text")
-                    return None
-            else:
-                self.logger.warning("🔇 Whisper returned no result or malformed result")
-                return None
-            
-        except Exception as e:
-            self.logger.error(f"❌ Whisper transcription error: {e}", exc_info=True)
-            return None
-
-    async def _transcribe_with_omni(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio using Qwen2.5-Omni multimodal model."""
-        try:
-            self.logger.info("🎵 Using Qwen2.5-Omni for direct audio processing...")
-            
-            # Save audio to temporary file for Omni
-            import tempfile
-            import scipy.io.wavfile as wavfile
-            
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                # Convert numpy array to WAV format
-                audio_int16 = np.clip(audio_data * 32767, -32767, 32767).astype(np.int16)
-                wavfile.write(temp_file.name, 16000, audio_int16)
-                temp_file_path = temp_file.name
-            
-            self.logger.info(f"🎵 Saved audio to {temp_file_path}, processing with Qwen2.5-Omni...")
-            
-            # Use Qwen2.5-Omni to process audio directly
-            response = await self.app_context.qwen_omni_service.generate_response(
-                text="Please transcribe the speech in this audio accurately.",
-                audio_path=temp_file_path
-            )
-            
-            # Clean up temporary file
-            os.unlink(temp_file_path)
-            
-            if response and len(response.strip()) > 0:
-                # Extract just the transcription from the response
-                transcription = response.strip()
-                
-                # Remove any assistant commentary, keep just the transcription
-                if "transcription:" in transcription.lower():
-                    transcription = transcription.split(":", 1)[1].strip()
-                elif "says:" in transcription.lower():
-                    transcription = transcription.split(":", 1)[1].strip()
-                elif '"' in transcription:
-                    # Extract quoted text if present
-                    import re
-                    quoted = re.findall(r'"([^"]*)"', transcription)
-                    if quoted:
-                        transcription = quoted[0]
-                
-                self.logger.info(f"✅ Qwen2.5-Omni transcription: '{transcription}'")
-                return transcription
-            else:
-                self.logger.info("🔇 Qwen2.5-Omni returned no transcription")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Qwen2.5-Omni transcription error: {e}")
-            return None
-
-    async def _transcribe_with_llamacpp(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio using LlamaCpp Qwen - DISABLED for GGUF."""
-        # LlamaCpp GGUF doesn't support audio transcription, return None to fall back to Whisper
-        self.logger.info("🎵 LlamaCpp audio transcription disabled - falling back to Whisper")
-        return None
-
-    async def recording_finished_callback(self, sink, channel: discord.TextChannel, *args):
-        """Callback when recording is finished (for compatibility)."""
-        self.logger.info("🎵 Recording session ended")
-
-    def _strip_think_tags(self, text: str) -> str:
-        """Remove <think>...</think> tags and comprehensive reasoning content from LLM responses"""
-        import re
-        
-        if not text:
-            return text
-        
-        # Remove <think>...</think> tags and content (case insensitive, multiline)
-        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL | re.IGNORECASE)
-        
-        # Remove reasoning sections that start with common patterns
-        reasoning_starters = [
-            r'let me think.*?\.',
-            r'hmm,.*?\.',
-            r'okay,.*?\.',
-            r'first,.*?\.',
-            r'looking at.*?\.',
-            r'based on.*?\.',
-            r'from.*?results.*?\.',
-            r'the user.*?asking.*?\.',
-            r'this.*?question.*?\.',
-            r'i need to.*?\.',
-            r'i should.*?\.',
-            r'let me.*?\.',
-            r'i\'ll.*?\.',
-            r'i can.*?\.',
-            r'to answer.*?\.',
-            r'for this.*?\.',
-            r'regarding.*?\.',
-            r'about.*?topic.*?\.',
-            r'concerning.*?\.',
-            r'with respect to.*?\.',
-            r'as for.*?\.',
-            r'in.*?to.*?question.*?\.'
-        ]
-        
-        for pattern in reasoning_starters:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
-        
-        # Remove standalone reasoning words/phrases at the start of lines
-        reasoning_lines = [
-            r'^hmm[,.]?\s*',
-            r'^okay[,.]?\s*',
-            r'^well[,.]?\s*',
-            r'^so[,.]?\s*',
-            r'^now[,.]?\s*',
-            r'^first[,.]?\s*',
-            r'^let me see[,.]?\s*',
-            r'^let me think[,.]?\s*',
-            r'^i need to[,.]?\s*',
-            r'^i should[,.]?\s*'
-        ]
-        
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            original_line = line
-            for pattern in reasoning_lines:
-                line = re.sub(pattern, '', line, flags=re.IGNORECASE)
-            
-            # Only keep lines that have substantial content after cleaning
-            if line.strip() and len(line.strip()) > 3:
-                cleaned_lines.append(line)
-            elif original_line.strip() and not any(re.match(pattern, original_line.strip(), re.IGNORECASE) for pattern in reasoning_lines):
-                # Keep original line if it wasn't a reasoning line
-                cleaned_lines.append(original_line)
-        
-        # Join lines and clean up extra whitespace
-        result = '\n'.join(cleaned_lines)
-        result = re.sub(r'\n\s*\n', '\n\n', result)  # Remove extra blank lines
-        result = result.strip()
-        
-        # If we cleaned everything away, try to extract the last meaningful sentence
-        if not result and text:
-            sentences = re.split(r'[.!?]+', text)
-            for sentence in reversed(sentences):
-                sentence = sentence.strip()
-                if (sentence and len(sentence) > 15 and 
-                    not any(re.search(pattern, sentence, re.IGNORECASE) for pattern in reasoning_starters)):
-                    result = sentence + '.'
-                    break
-        
-        return result
-
-    async def _generate_and_play_voice_response(self, response_text: str, channel: discord.TextChannel, user_name: str):
-        """Generate TTS audio and play it in the voice channel."""
-        try:
-            self.logger.info(f"🔊 Generating TTS for response to {user_name}")
-            
-            # Strip markdown formatting for TTS
-            tts_text = self._strip_markdown_for_tts(response_text)
-            
-            # Generate TTS audio
-            if not self.tts_service:
-                self.logger.error("❌ TTS service not available")
-                return
-                
-            loop = asyncio.get_event_loop()
-            tts_audio = await loop.run_in_executor(
-                None,
-                self.tts_service.generate_audio,
-                tts_text
-            )
-            
-            if tts_audio:
-                self.logger.info(f"✅ TTS audio generated ({len(tts_audio)} bytes)")
-                
-                # Find voice channel to play response
-                voice_channel = None
-                for guild in self.guilds:
-                    if guild.id in self.connections:
-                        voice_channel = self.connections[guild.id].channel
-                        break
-                
-                if voice_channel:
+            async def monitor_loop():
+                while not self.is_closed():
                     try:
-                        # Connect to voice channel for playback
-                        voice_client = await voice_channel.connect(timeout=10.0)
-                        
-                        # Save TTS audio to temporary file
-                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                            temp_file.write(tts_audio)
-                            temp_file_path = temp_file.name
-                        
-                        # Play the audio
-                        audio_source = discord.FFmpegPCMAudio(temp_file_path)
-                        voice_client.play(audio_source)
-                        
-                        # Wait for playback to finish
-                        while voice_client.is_playing():
-                            await asyncio.sleep(0.1)
-                        
-                        # Disconnect and cleanup
-                        await voice_client.disconnect()
-                        os.unlink(temp_file_path)
-                        
-                        self.logger.info("🎵 Voice response played successfully")
-                        
+                        await self._check_discord_connection_health()
+                        await asyncio.sleep(30)  # Check every 30 seconds
                     except Exception as e:
-                        self.logger.error(f"❌ Failed to play voice response: {e}")
-                        await channel.send("🔊 Generated voice response but couldn't play it in voice channel.")
-                else:
-                    self.logger.warning(f"🔇 Could not find voice channel for playback")
-                    await channel.send("🔊 Generated voice response but no voice channel available.")
-            else:
-                self.logger.error("❌ TTS generation failed")
-                await channel.send("🔊 Sorry, I couldn't generate a voice response.")
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error in voice response generation: {e}")
-
-    def _strip_markdown_for_tts(self, text: str) -> str:
-        """Remove Discord formatting for TTS playback"""
-        import re
-        # Remove Discord code blocks
-        text = re.sub(r'```[a-zA-Z]*\n.*?\n```', '', text, flags=re.DOTALL)
-        text = re.sub(r'`([^`]+)`', r'\1', text)
-        
-        # Remove Discord formatting
-        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Bold
-        text = re.sub(r'\*([^*]+)\*', r'\1', text)      # Italic
-        text = re.sub(r'__([^_]+)__', r'\1', text)      # Underline
-        text = re.sub(r'~~([^~]+)~~', r'\1', text)      # Strikethrough
-        
-        # Remove URLs in markdown format
-        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-        
-        return text.strip()
-
-    async def _play_tts_audio(self, tts_audio: bytes):
-        """Play TTS audio in the connected voice channel"""
-        try:
-            # Find an active voice connection
-            voice_client = None
-            for guild in self.guilds:
-                if guild.voice_client and guild.voice_client.is_connected():
-                    voice_client = guild.voice_client
-                    break
+                        self.logger.error(f"Connection monitor error: {e}")
+                        await asyncio.sleep(60)  # Wait longer on error
             
-            if not voice_client:
-                self.logger.warning("🔇 No voice connection available for TTS playback")
-                return
-            
-            # Save TTS audio to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                temp_file.write(tts_audio)
-                temp_file_path = temp_file.name
-            
-            self.logger.info(f"🔊 Playing TTS audio in {voice_client.channel.name}")
-            
-            # Create audio source and play
-            audio_source = discord.FFmpegPCMAudio(temp_file_path)
-            voice_client.play(audio_source)
-            
-            # Wait for playback to finish
-            while voice_client.is_playing():
-                await asyncio.sleep(0.1)
-            
-            # Clean up temporary file
-            try:
-                os.unlink(temp_file_path)
-            except:
-                pass  # Don't fail if cleanup fails
-            
-            self.logger.info("✅ TTS audio playback completed")
+            # Start monitoring in background
+            asyncio.create_task(monitor_loop())
+            self.logger.info("✅ Discord connection monitor started")
             
         except Exception as e:
-            self.logger.error(f"❌ TTS playback failed: {e}")
+            self.logger.error(f"Failed to start connection monitor: {e}")
 
     async def _play_tts_audio_with_feedback_prevention(self, tts_audio: bytes):
         """Play TTS audio in the connected voice channel with feedback prevention"""
@@ -3324,10 +3339,10 @@ class DanzarVoiceBot(commands.Bot):
                     
                     try:
                         # Get transcription from queue (non-blocking)
-                        transcription_data = self.virtual_audio.transcription_queue.get_nowait()
+                        transcription = self.virtual_audio.transcription_queue.get_nowait()
                         
-                        transcription = transcription_data['transcription']
-                        user_name = transcription_data['user']
+                        # Use a default user name since we don't have user info in the string-only approach
+                        user_name = "VirtualAudio"
                         
                         self.logger.info(f"📥 Processing queued transcription: '{transcription}'")
                         
@@ -3418,84 +3433,19 @@ class DanzarVoiceBot(commands.Bot):
                             await text_channel.send(f"🎤 **{user_name}**: {transcription}")
                             self.logger.info(f"📤 Sent transcription to Discord: '{transcription}'")
                             
-                            # Process with LLM
-                            if self.llm_service:
+                            # Process with Streaming LLM for real-time responses
+                            use_streaming = self.app_context.global_settings.get('STREAMING_RESPONSE', {}).get('enabled', True)
+                            
+                            if use_streaming:
                                 try:
-                                    self.logger.info("🧠 Processing with LLM...")
-                                    
-                                    # Check if LLM-guided search mode is enabled
-                                    if getattr(self, 'llm_search_mode', False):
-                                        self.logger.info("🔍 Using LLM-guided search mode")
-                                        response = await self.llm_service.handle_user_text_query_with_llm_search(
-                                            user_text=transcription,
-                                            user_name=user_name
-                                        )
-                                        # Extract response text if it's a tuple
-                                        if isinstance(response, tuple):
-                                            response_text, metadata = response
-                                            self.logger.info(f"🔍 LLM search method: {metadata.get('method', 'unknown')}")
-                                            response = response_text
-                                    else:
-                                        response = await self.llm_service.handle_user_text_query(
-                                            user_text=transcription,
-                                            user_name=user_name
-                                        )
-                                    
-                                    if response and len(response.strip()) > 0:
-                                        # Strip think tags from LLM response
-                                        clean_response = self._strip_think_tags(response)
-                                        
-                                        await text_channel.send(f"🤖 **DanzarAI**: {clean_response}")
-                                        self.logger.info(f"🤖 Sent LLM response: '{clean_response[:100]}...'")
-                                        
-                                        # Add bot response to short-term memory (use clean response)
-                                        if self.app_context.short_term_memory_service:
-                                            self.app_context.short_term_memory_service.add_entry(
-                                                user_name=user_name,
-                                                content=clean_response,
-                                                entry_type='bot_response'
-                                            )
-                                            self.logger.debug(f"[ShortTermMemory] Stored bot response from queue: '{clean_response[:50]}...'")
-                                        
-                                        # Generate and play TTS if available (use clean response)
-                                        if self.tts_service:
-                                            try:
-                                                self.logger.info("🔊 Generating TTS for queue response...")
-                                                tts_text = self._strip_markdown_for_tts(clean_response)
-                                                
-                                                # ===== START FEEDBACK PREVENTION =====
-                                                self.feedback_prevention.start_tts_playback(tts_text)
-                                                
-                                                # Generate TTS audio asynchronously
-                                                loop = asyncio.get_event_loop()
-                                                tts_audio = await loop.run_in_executor(
-                                                    None,
-                                                    self.tts_service.generate_audio,
-                                                    tts_text
-                                                )
-                                                
-                                                if tts_audio:
-                                                    self.logger.info("✅ TTS audio generated successfully")
-                                                    await self._play_tts_audio_with_feedback_prevention(tts_audio)
-                                                else:
-                                                    self.logger.warning("⚠️ TTS generation failed")
-                                                    self.feedback_prevention.stop_tts_playback()
-                                                    
-                                            except Exception as tts_e:
-                                                self.logger.error(f"❌ TTS error in queue processor: {tts_e}")
-                                                # Stop feedback prevention on error
-                                                self.feedback_prevention.stop_tts_playback()
-                                    else:
-                                        await text_channel.send("🤖 **DanzarAI**: I heard you, but I'm not sure how to respond to that.")
-                                        
+                                    await self._process_streaming_response(transcription, user_name, text_channel)
                                 except Exception as e:
-                                    self.logger.error(f"❌ LLM processing error: {e}")
-                                    await text_channel.send("🤖 **DanzarAI**: Sorry, I had trouble processing that.")
+                                    self.logger.error(f"❌ Streaming LLM processing error: {e}")
+                                    # Fallback to regular LLM
+                                    await self._process_regular_response(transcription, user_name, text_channel)
                             else:
-                                # Fallback response
-                                response = f"I heard you say: '{transcription}'. My LLM service isn't available right now."
-                                await text_channel.send(f"🤖 **DanzarAI**: {response}")
-                                self.logger.info("🤖 Sent fallback response (no LLM service)")
+                                # Use regular LLM processing
+                                await self._process_regular_response(transcription, user_name, text_channel)
                         else:
                             self.logger.warning("⚠️  No configured text channel available for transcription responses")
                             
@@ -3645,6 +3595,12 @@ class DanzarVoiceBot(commands.Bot):
                 self.logger.warning("⚠️ TTS service not available for chunked playback")
                 return
             
+            # Import AzureTTSService for isinstance check
+            try:
+                from services.tts_service_azure import AzureTTSService
+            except ImportError:
+                AzureTTSService = None
+            
             # Check if streaming TTS is enabled
             use_streaming = self.app_context.global_settings.get('TTS_SERVER', {}).get('enable_streaming', True)
             
@@ -3652,26 +3608,23 @@ class DanzarVoiceBot(commands.Bot):
                 # Use new streaming TTS approach
                 self.logger.info("🎵 Using streaming TTS for progressive playback")
                 
-                # Start feedback prevention for the entire response
                 self.feedback_prevention.start_tts_playback(response_text)
-                
-                # Start TTS queue processor for ordered playback
                 await self._start_tts_queue_processor()
-                
-                # Create callback to handle each audio chunk as it's generated
                 successful_chunks = 0
-                
                 def audio_chunk_callback(audio_data: bytes):
                     nonlocal successful_chunks
                     try:
-                        # Add to TTS queue for ordered playback
-                        asyncio.create_task(self._queue_tts_audio(audio_data))
-                        successful_chunks += 1
-                        self.logger.info(f"🎵 Streaming chunk queued for ordered playback ({len(audio_data)} bytes)")
+                        if hasattr(self, 'tts_queue') and self.tts_queue:
+                            try:
+                                self.tts_queue.put_nowait(audio_data)
+                                successful_chunks += 1
+                                self.logger.info(f"🎵 Streaming chunk queued for ordered playback ({len(audio_data)} bytes)")
+                            except asyncio.QueueFull:
+                                self.logger.warning("⚠️ TTS queue full, dropping chunk")
+                        else:
+                            self.logger.warning("⚠️ TTS queue not available")
                     except Exception as e:
                         self.logger.error(f"❌ Failed to queue streaming chunk: {e}")
-                
-                # Generate and stream audio chunks
                 loop = asyncio.get_event_loop()
                 success = await loop.run_in_executor(
                     None,
@@ -3679,38 +3632,28 @@ class DanzarVoiceBot(commands.Bot):
                     response_text,
                     audio_chunk_callback
                 )
-                
-                # Stop feedback prevention after streaming completes
                 self.feedback_prevention.stop_tts_playback()
-                
                 if success and successful_chunks > 0:
                     self.logger.info(f"✅ Streaming TTS completed: {successful_chunks} chunks streamed")
                 else:
                     self.logger.error("❌ Streaming TTS failed")
-                    
             else:
-                # Fall back to traditional chunked approach
                 self.logger.info("🔊 Using traditional chunked TTS")
-                
-                # Chunk the response
                 chunks = self._chunk_response_for_tts(response_text, max_chunk_length=150)
-                
                 if len(chunks) == 1:
-                    # Single chunk, use normal TTS processing
                     self.logger.info("🔊 Single chunk TTS generation...")
                     tts_text = chunks[0]
-                    
-                    # Start feedback prevention
                     self.feedback_prevention.start_tts_playback(tts_text)
-                    
-                    # Generate TTS audio
-                    loop = asyncio.get_event_loop()
-                    tts_audio = await loop.run_in_executor(
-                        None,
-                        self.tts_service.generate_audio,
-                        tts_text
-                    )
-                    
+                    tts_audio = None
+                    if AzureTTSService and isinstance(self.tts_service, AzureTTSService):
+                        tts_audio = await self.tts_service.synthesize_speech(tts_text)
+                    else:
+                        loop = asyncio.get_event_loop()
+                        tts_audio = await loop.run_in_executor(
+                            None,
+                            self.tts_service.generate_audio,
+                            tts_text
+                        )
                     if tts_audio:
                         self.logger.info("✅ Single chunk TTS audio generated")
                         await self._play_tts_audio_with_feedback_prevention(tts_audio)
@@ -3718,55 +3661,53 @@ class DanzarVoiceBot(commands.Bot):
                         self.logger.warning("⚠️ Single chunk TTS generation failed")
                         self.feedback_prevention.stop_tts_playback()
                 else:
-                    # Multiple chunks, play sequentially
                     self.logger.info(f"🔊 Multi-chunk TTS generation ({len(chunks)} chunks)...")
-                    
-                    # Start feedback prevention for the entire sequence
                     full_text = " ".join(chunks)
                     self.feedback_prevention.start_tts_playback(full_text)
-                    
                     successful_chunks = 0
-                    
-                    for i, chunk in enumerate(chunks):
-                        try:
-                            self.logger.info(f"🔊 Generating TTS chunk {i+1}/{len(chunks)}: '{chunk[:50]}...'")
-                            
-                            # Generate TTS for this chunk
-                            loop = asyncio.get_event_loop()
-                            tts_audio = await loop.run_in_executor(
-                                None,
-                                self.tts_service.generate_audio,
-                                chunk
-                            )
-                            
-                            if tts_audio:
-                                self.logger.info(f"✅ Chunk {i+1} TTS audio generated")
-                                
-                                # Play this chunk (without stopping feedback prevention)
-                                await self._play_single_tts_chunk(tts_audio)
-                                successful_chunks += 1
-                                
-                                # Brief pause between chunks for natural flow
-                                if i < len(chunks) - 1:  # Don't pause after last chunk
-                                    await asyncio.sleep(0.3)
-                            else:
-                                self.logger.warning(f"⚠️ Chunk {i+1} TTS generation failed")
-                                
-                        except Exception as e:
-                            self.logger.error(f"❌ Error processing TTS chunk {i+1}: {e}")
-                            continue
-                    
-                    # Stop feedback prevention after all chunks
+                    if AzureTTSService and isinstance(self.tts_service, AzureTTSService):
+                        audio_chunks = await self.tts_service.synthesize_speech_chunked(full_text, max_chunk_length=150)
+                        for i, tts_audio in enumerate(audio_chunks):
+                            try:
+                                if tts_audio:
+                                    self.logger.info(f"✅ Chunk {i+1} TTS audio generated (Azure)")
+                                    await self._play_single_tts_chunk(tts_audio)
+                                    successful_chunks += 1
+                                    if i < len(audio_chunks) - 1:
+                                        await asyncio.sleep(0.3)
+                                else:
+                                    self.logger.warning(f"⚠️ Chunk {i+1} TTS generation failed (Azure)")
+                            except Exception as e:
+                                self.logger.error(f"❌ Error processing TTS chunk {i+1} (Azure): {e}")
+                                continue
+                    else:
+                        for i, chunk in enumerate(chunks):
+                            try:
+                                self.logger.info(f"🔊 Generating TTS chunk {i+1}/{len(chunks)}: '{chunk[:50]}...'")
+                                loop = asyncio.get_event_loop()
+                                tts_audio = await loop.run_in_executor(
+                                    None,
+                                    self.tts_service.generate_audio,
+                                    chunk
+                                )
+                                if tts_audio:
+                                    self.logger.info(f"✅ Chunk {i+1} TTS audio generated")
+                                    await self._play_single_tts_chunk(tts_audio)
+                                    successful_chunks += 1
+                                    if i < len(chunks) - 1:
+                                        await asyncio.sleep(0.3)
+                                else:
+                                    self.logger.warning(f"⚠️ Chunk {i+1} TTS generation failed")
+                            except Exception as e:
+                                self.logger.error(f"❌ Error processing TTS chunk {i+1}: {e}")
+                                continue
                     self.feedback_prevention.stop_tts_playback()
-                    
                     if successful_chunks > 0:
                         self.logger.info(f"✅ Multi-chunk TTS completed ({successful_chunks}/{len(chunks)} successful)")
                     else:
                         self.logger.error("❌ All TTS chunks failed")
-                    
         except Exception as e:
             self.logger.error(f"❌ Error in chunked TTS generation: {e}")
-            # Make sure to stop feedback prevention on error
             self.feedback_prevention.stop_tts_playback()
 
     async def _play_single_tts_chunk(self, tts_audio: bytes):
@@ -3868,6 +3809,618 @@ class DanzarVoiceBot(commands.Bot):
             self.logger.debug(f"🎵 Queued TTS audio chunk ({len(audio_data)} bytes)")
         except Exception as e:
             self.logger.error(f"❌ Failed to queue TTS audio: {e}")
+
+    async def _process_streaming_response(self, transcription: str, user_name: str, text_channel):
+        """Process user input with real-time streaming response generation and immediate TTS"""
+        try:
+            self.logger.info("🎵 Processing with Real-Time Streaming LLM for immediate responses...")
+            
+            # Initialize real-time streaming service if not already done
+            if not hasattr(self, 'real_time_streaming_service'):
+                self.logger.warning("⚠️ Real-Time Streaming Service not available, falling back to regular processing")
+                await self._process_regular_response(transcription, user_name, text_channel)
+                return
+            
+            # Start TTS queue processor for ordered playback
+            await self._start_tts_queue_processor()
+            
+            # Create callbacks for real-time streaming
+            response_chunks = []
+            current_response = ""
+            
+            def text_callback(chunk_text: str):
+                """Callback for text chunks - update Discord in real-time"""
+                nonlocal current_response
+                current_response += chunk_text
+                response_chunks.append(chunk_text)
+                self.logger.debug(f"🎵 Text chunk received: '{chunk_text[:30]}...'")
+            
+            async def tts_callback(chunk_text: str):
+                """Callback for TTS chunks - generate audio immediately"""
+                try:
+                    if chunk_text.strip():
+                        self.logger.info(f"🎵 Generating TTS for chunk: '{chunk_text[:50]}...'")
+                        
+                        # Check if it's Azure TTS
+                        try:
+                            from services.tts_service_azure import AzureTTSService
+                            if isinstance(self.tts_service, AzureTTSService):
+                                tts_audio = await self.tts_service.synthesize_speech(chunk_text)
+                            else:
+                                tts_audio = self.tts_service.generate_audio(chunk_text)
+                        except ImportError:
+                            tts_audio = self.tts_service.generate_audio(chunk_text)
+                        
+                        if tts_audio:
+                            await self._queue_tts_audio(tts_audio)
+                            self.logger.info(f"🎵 ✅ TTS generated and queued for chunk ({len(tts_audio)} bytes)")
+                        else:
+                            self.logger.warning(f"🎵 ⚠️ Failed to generate TTS for chunk")
+                except Exception as e:
+                    self.logger.error(f"🎵 ❌ Error in TTS callback: {e}")
+            
+            def progress_callback(chunk_text: str, is_final: bool):
+                """Callback for progress updates"""
+                if is_final:
+                    self.logger.info("🎵 Streaming response completed")
+                else:
+                    self.logger.debug(f"🎵 Progress: {len(response_chunks)} chunks processed")
+            
+            # Calculate estimated duration for feedback prevention
+            estimated_words = len(transcription.split()) * 2  # Rough estimate
+            estimated_duration = max(3.0, estimated_words / 2.5)  # ~2.5 words per second
+            
+            # Start feedback prevention
+            self.feedback_prevention.start_tts_playback("Streaming response", estimated_duration=estimated_duration)
+            self.logger.info(f"🛡️ Started feedback prevention for {estimated_duration:.1f}s")
+            
+            # Generate streaming response with real-time callbacks
+            full_response = await self.real_time_streaming_service.handle_user_text_query_streaming(
+                user_text=transcription,
+                user_name=user_name,
+                text_callback=text_callback,
+                tts_callback=tts_callback,
+                progress_callback=progress_callback
+            )
+            
+            # Send complete response to Discord if we have chunks
+            if response_chunks:
+                clean_response = self._strip_think_tags(full_response)
+                await text_channel.send(f"🤖 **DanzarAI**: {clean_response}")
+                self.logger.info(f"🤖 Sent streaming response: '{clean_response[:100]}...'")
+                
+                # Add to short-term memory
+                if self.app_context.short_term_memory_service:
+                    self.app_context.short_term_memory_service.add_entry(
+                        user_name=user_name,
+                        content=clean_response,
+                        entry_type='bot_response'
+                    )
+            else:
+                await text_channel.send("🤖 **DanzarAI**: I heard you, but I'm not sure how to respond to that.")
+                # Stop feedback prevention if no response
+                self.feedback_prevention.stop_tts_playback()
+            
+            self.logger.info(f"🎵 ✅ Real-time streaming completed with {len(response_chunks)} chunks")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in real-time streaming response processing: {e}")
+            self.feedback_prevention.stop_tts_playback()
+            # Fallback to regular processing
+            await self._process_regular_response(transcription, user_name, text_channel)
+
+    async def _process_regular_response(self, transcription: str, user_name: str, text_channel):
+        """Process user input with regular LLM and traditional TTS"""
+        try:
+            if self.llm_service:
+                self.logger.info("🧠 Processing with regular LLM...")
+                
+                # Check if LLM-guided search mode is enabled
+                if getattr(self, 'llm_search_mode', False):
+                    self.logger.info("🔍 Using LLM-guided search mode")
+                    response = await self.llm_service.handle_user_text_query_with_llm_search(
+                        user_text=transcription,
+                        user_name=user_name
+                    )
+                    # Extract response text if it's a tuple
+                    if isinstance(response, tuple):
+                        response_text, metadata = response
+                        self.logger.info(f"🔍 LLM search method: {metadata.get('method', 'unknown')}")
+                        response = response_text
+                else:
+                    response = await self.llm_service.handle_user_text_query(
+                        user_text=transcription,
+                        user_name=user_name
+                    )
+                
+                if response and len(response.strip()) > 0:
+                    # Strip think tags from LLM response
+                    clean_response = self._strip_think_tags(response)
+                    
+                    await text_channel.send(f"🤖 **DanzarAI**: {clean_response}")
+                    self.logger.info(f"🤖 Sent LLM response: '{clean_response[:100]}...'")
+                    
+                    # Add bot response to short-term memory
+                    if self.app_context.short_term_memory_service:
+                        self.app_context.short_term_memory_service.add_entry(
+                            user_name=user_name,
+                            content=clean_response,
+                            entry_type='bot_response'
+                        )
+                    
+                    # Generate and play TTS using chunked approach
+                    await self._generate_and_play_chunked_tts(clean_response, text_channel, user_name)
+                    
+                else:
+                    await text_channel.send("🤖 **DanzarAI**: I heard you, but I'm not sure how to respond to that.")
+                    
+            else:
+                # Fallback response
+                response = f"I heard you say: '{transcription}'. My LLM service isn't available right now."
+                await text_channel.send(f"🤖 **DanzarAI**: {response}")
+                self.logger.info("🤖 Sent fallback response (no LLM service)")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in regular response processing: {e}")
+            await text_channel.send("🤖 **DanzarAI**: Sorry, I had trouble processing that.")
+
+    async def _qwen_analyze(self, ctx, prompt: str):
+        """Analyze current OBS frame with Qwen2.5-VL"""
+        try:
+            # Check if Qwen2.5-VL integration is available
+            if not hasattr(self.app_context, 'qwen_vl_integration') or not self.app_context.qwen_vl_integration:
+                await ctx.send("❌ **Qwen2.5-VL Integration not available**\n"
+                              "Make sure the CUDA server is running and the service is initialized")
+                return
+            
+            await ctx.send("🎯 **Analyzing with Qwen2.5-VL (CUDA)...** 🔍")
+            
+            # Get OBS frame from the integration service
+            try:
+                from services.obs_video_service import OBSVideoService
+                obs_service = OBSVideoService(self.app_context)
+                await obs_service.initialize()
+                
+                frame = obs_service.capture_obs_screenshot()
+                if frame is None:
+                    await ctx.send("❌ **Failed to capture OBS frame**\nMake sure OBS Studio is running with NDI source")
+                    return
+                
+            except Exception as e:
+                self.logger.error(f"OBS capture error: {e}")
+                await ctx.send("❌ **Failed to capture OBS frame**\nCheck OBS connection and source configuration")
+                return
+            
+            # Analyze with Qwen2.5-VL
+            start_time = time.time()
+            analysis = await self.app_context.qwen_vl_integration.analyze_obs_frame(frame, prompt)
+            analysis_time = time.time() - start_time
+            
+            if analysis:
+                embed = discord.Embed(
+                    title="🎯 Qwen2.5-VL Analysis Result",
+                    description=analysis,
+                    color=discord.Color.purple()
+                )
+                
+                embed.add_field(
+                    name="⚡ Performance",
+                    value=f"⏱️ {analysis_time:.2f}s | 🎯 CUDA Accelerated",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="💡 Tip",
+                    value="Use `!qwen quick` for fast analysis or `!qwen detailed` for comprehensive analysis",
+                    inline=False
+                )
+                
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("❌ **Qwen2.5-VL analysis failed**\nCheck if the CUDA server is running properly")
+                
+        except Exception as e:
+            self.logger.error(f"Qwen analysis error: {e}")
+            await ctx.send(f"❌ **Qwen2.5-VL analysis error**: {str(e)}")
+    
+    async def _qwen_commentary(self, ctx):
+        """Generate live gaming commentary with Qwen2.5-VL"""
+        try:
+            if not hasattr(self.app_context, 'qwen_vl_integration') or not self.app_context.qwen_vl_integration:
+                await ctx.send("❌ **Qwen2.5-VL Integration not available**")
+                return
+            
+            await ctx.send("🎮 **Generating live gaming commentary...** 🎯")
+            
+            # Get OBS frame
+            try:
+                from services.obs_video_service import OBSVideoService
+                obs_service = OBSVideoService(self.app_context)
+                await obs_service.initialize()
+                
+                frame = obs_service.capture_obs_screenshot()
+                if frame is None:
+                    await ctx.send("❌ **Failed to capture OBS frame**")
+                    return
+                
+            except Exception as e:
+                self.logger.error(f"OBS capture error: {e}")
+                await ctx.send("❌ **Failed to capture OBS frame**")
+                return
+            
+            # Generate commentary
+            commentary = await self.app_context.qwen_vl_integration.generate_gaming_commentary(frame)
+            
+            if commentary:
+                embed = discord.Embed(
+                    title="🎮 Live Gaming Commentary",
+                    description=commentary,
+                    color=discord.Color.green()
+                )
+                
+                embed.add_field(
+                    name="🎯 Qwen2.5-VL",
+                    value="Real-time gaming insights with CUDA acceleration",
+                    inline=False
+                )
+                
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("❌ **Commentary generation failed**")
+                
+        except Exception as e:
+            self.logger.error(f"Qwen commentary error: {e}")
+            await ctx.send(f"❌ **Commentary error**: {str(e)}")
+    
+    async def _qwen_status(self, ctx):
+        """Show Qwen2.5-VL performance statistics"""
+        try:
+            if not hasattr(self.app_context, 'qwen_vl_integration') or not self.app_context.qwen_vl_integration:
+                await ctx.send("❌ **Qwen2.5-VL Integration not available**")
+                return
+            
+            stats = self.app_context.qwen_vl_integration.get_performance_stats()
+            
+            embed = discord.Embed(
+                title="📊 Qwen2.5-VL Performance Stats",
+                color=discord.Color.blue()
+            )
+            
+            embed.add_field(
+                name="🎯 Analysis Stats",
+                value=f"✅ **Successful**: {stats['successful_analyses']}\n"
+                      f"❌ **Failed**: {stats['failed_analyses']}\n"
+                      f"📈 **Success Rate**: {stats['success_rate']:.1f}%",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="⏱️ Performance",
+                value=f"⚡ **Avg Time**: {stats['average_time']:.2f}s\n"
+                      f"🎯 **CUDA**: {'✅' if stats['cuda_available'] else '❌'}\n"
+                      f"🔄 **Fallback**: {'✅' if stats['transformers_fallback'] else '❌'}",
+                inline=True
+            )
+            
+            if stats['recent_times']:
+                recent_avg = sum(stats['recent_times']) / len(stats['recent_times'])
+                embed.add_field(
+                    name="📈 Recent Performance",
+                    value=f"🕒 **Last 5 Avg**: {recent_avg:.2f}s\n"
+                          f"📊 **Recent Times**: {', '.join([f'{t:.1f}s' for t in stats['recent_times'][-3:]])}",
+                    inline=False
+                )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Qwen status error: {e}")
+            await ctx.send(f"❌ **Status error**: {str(e)}")
+    
+    async def _qwen_history(self, ctx):
+        """Show recent Qwen2.5-VL analysis history"""
+        try:
+            if not hasattr(self.app_context, 'qwen_vl_integration') or not self.app_context.qwen_vl_integration:
+                await ctx.send("❌ **Qwen2.5-VL Integration not available**")
+                return
+            
+            history = self.app_context.qwen_vl_integration.get_commentary_history(limit=5)
+            
+            if not history:
+                await ctx.send("📝 **No recent analyses found**")
+                return
+            
+            embed = discord.Embed(
+                title="📝 Recent Qwen2.5-VL Analyses",
+                color=discord.Color.green()
+            )
+            
+            for i, entry in enumerate(reversed(history), 1):
+                timestamp = entry['timestamp'].strftime("%H:%M:%S")
+                commentary = entry['commentary'][:100] + "..." if len(entry['commentary']) > 100 else entry['commentary']
+                
+                embed.add_field(
+                    name=f"📊 Analysis #{i} ({timestamp})",
+                    value=commentary,
+                    inline=False
+                )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Qwen history error: {e}")
+            await ctx.send(f"❌ **History error**: {str(e)}")
+
+    async def process_simple_discord_audio(self, audio_data: bytes):
+        """Process audio data from Discord voice channel"""
+        try:
+            # Convert audio data to numpy array for processing
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Process with VAD to detect speech
+            is_speech, is_speech_end = self.vad.process_audio_chunk(audio_data)
+            
+            if is_speech:
+                self.logger.debug("🎤 Speech detected in Discord audio")
+                
+                # Get speech audio when speech ends
+                if is_speech_end:
+                    speech_audio = self.vad.get_speech_audio()
+                    if speech_audio is not None:
+                        # Transcribe the speech
+                        transcription = await self.transcribe_audio(speech_audio)
+                        if transcription and len(transcription.strip()) > 0:
+                            self.logger.info(f"🎯 Discord transcription: '{transcription}'")
+                            
+                            # Process the transcription
+                            await self._process_transcription(transcription, "Discord User")
+                            
+        except Exception as e:
+            self.logger.error(f"Error processing Discord audio: {e}")
+
+    async def _process_transcription(self, transcription: str, user_name: str):
+        """Process transcription with conversational AI service for turn-taking"""
+        try:
+            # Use conversational AI service if available
+            if (hasattr(self.app_context, 'conversational_ai_service') and 
+                self.app_context.conversational_ai_service):
+                
+                service = self.app_context.conversational_ai_service
+                
+                # Get current game context from video analysis if available
+                game_context = None
+                if hasattr(self.app_context, 'qwen_vl_integration') and self.app_context.qwen_vl_integration:
+                    try:
+                        # Get recent game context from video analysis
+                        game_context = f"Playing {service.current_game}"
+                    except:
+                        pass
+                
+                # Process with conversational AI service
+                response = await service.process_user_message(
+                    user_id="discord_user",  # We don't have user ID in this context
+                    user_name=user_name,
+                    message=transcription,
+                    game_context=game_context
+                )
+                
+                if response:
+                    # Update conversation state
+                    service.conversation_state = service.ConversationState.SPEAKING
+                    
+                    # Send response to Discord
+                    text_channel = self.get_configured_text_channel()
+                    if text_channel:
+                        await text_channel.send(f"🤖 **Danzar**: {response}")
+                    
+                    # Generate TTS if available
+                    if hasattr(self, 'tts_service') and self.tts_service:
+                        try:
+                            tts_audio = self.tts_service.generate_audio(response)
+                            if tts_audio:
+                                await self._queue_tts_audio(tts_audio)
+                                self.logger.info(f"🎵 TTS generated for conversational response ({len(tts_audio)} bytes)")
+                        except Exception as e:
+                            self.logger.error(f"❌ TTS generation error: {e}")
+                    
+                    # Reset conversation state after speaking
+                    await asyncio.sleep(1)  # Brief pause
+                    service.conversation_state = service.ConversationState.IDLE
+                else:
+                    self.logger.info(f"⏳ User {user_name} must wait for turn")
+            else:
+                # Fallback to regular processing
+                text_channel = self.get_configured_text_channel()
+                if text_channel:
+                    await self._process_regular_response(transcription, user_name, text_channel)
+                else:
+                    self.logger.warning("No text channel configured for responses")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error processing transcription with conversational AI: {e}")
+            # Fallback to regular processing
+            text_channel = self.get_configured_text_channel()
+            if text_channel:
+                await self._process_regular_response(transcription, user_name, text_channel)
+
+    def process_virtual_audio_sync(self, audio_data: np.ndarray):
+        """Process virtual audio data synchronously (called from audio callback thread)"""
+        try:
+            # This method is called from the audio callback thread
+            # We need to schedule the async processing in the main event loop
+            if hasattr(self, 'loop') and self.loop:
+                # Schedule the async processing
+                asyncio.run_coroutine_threadsafe(
+                    self._process_virtual_audio_async(audio_data), 
+                    self.loop
+                )
+        except Exception as e:
+            self.logger.error(f"Error in process_virtual_audio_sync: {e}")
+
+    async def _process_virtual_audio_async(self, audio_data: np.ndarray):
+        """Process virtual audio data asynchronously (runs in main event loop)"""
+        try:
+            # Transcribe the audio
+            if hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service:
+                # Use faster-whisper for transcription
+                transcription = await self.app_context.faster_whisper_stt_service.transcribe_audio_data(audio_data)
+            else:
+                # Fallback to basic transcription
+                transcription = "Audio received but no STT service available"
+            
+            if transcription and len(transcription.strip()) > 0:
+                self.logger.info(f"🎤 Virtual audio transcription: '{transcription}'")
+                
+                # Process the transcription
+                await self._process_transcription(transcription, "Virtual Audio User")
+                
+        except Exception as e:
+            self.logger.error(f"Error in _process_virtual_audio_async: {e}")
+
+    def process_vad_transcription(self, transcription: str):
+        """Process VAD transcription (called from VAD service)"""
+        try:
+            if hasattr(self, 'loop') and self.loop:
+                # Schedule the async processing
+                asyncio.run_coroutine_threadsafe(
+                    self._process_transcription(transcription, "VAD User"), 
+                    self.loop
+                )
+        except Exception as e:
+            self.logger.error(f"Error in process_vad_transcription: {e}")
+
+    def process_offline_voice_response(self, response: str):
+        """Process offline voice response (called from offline VAD service)"""
+        try:
+            if hasattr(self, 'loop') and self.loop:
+                # Schedule the async processing
+                asyncio.run_coroutine_threadsafe(
+                    self._process_offline_response_async(response), 
+                    self.loop
+                )
+        except Exception as e:
+            self.logger.error(f"Error in process_offline_voice_response: {e}")
+
+    async def _process_offline_response_async(self, response: str):
+        """Process offline response asynchronously"""
+        try:
+            if response and len(response.strip()) > 0:
+                self.logger.info(f"🤖 Offline response: '{response[:100]}...'")
+                
+                # Send to text channel if available
+                text_channel = self.get_configured_text_channel()
+                if text_channel:
+                    await text_channel.send(f"🤖 **DanzarAI**: {response}")
+                
+                # Generate TTS if available
+                if hasattr(self, 'tts_service') and self.tts_service:
+                    try:
+                        tts_audio = self.tts_service.generate_audio(response)
+                        if tts_audio:
+                            await self._queue_tts_audio(tts_audio)
+                    except Exception as e:
+                        self.logger.error(f"TTS generation failed: {e}")
+                        
+        except Exception as e:
+            self.logger.error(f"Error in _process_offline_response_async: {e}")
+
+    def _strip_markdown_for_tts(self, text: str) -> str:
+        """Strip markdown formatting for TTS processing"""
+        import re
+        # Remove Discord markdown
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Bold
+        text = re.sub(r'\*(.*?)\*', r'\1', text)      # Italic
+        text = re.sub(r'`(.*?)`', r'\1', text)        # Code
+        text = re.sub(r'~~(.*?)~~', r'\1', text)      # Strikethrough
+        text = re.sub(r'__(.*?)__', r'\1', text)      # Underline
+        text = re.sub(r'~~(.*?)~~', r'\1', text)      # Strikethrough
+        # Remove URLs
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+        # Remove emojis
+        text = re.sub(r'<:[^>]+>', '', text)
+        text = re.sub(r'<a:[^>]+>', '', text)
+        # Clean up extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _strip_think_tags(self, text: str) -> str:
+        """Strip think tags from LLM responses"""
+        import re
+        # Remove <think>...</think> tags
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # Remove [THINK]...[/THINK] tags
+        text = re.sub(r'\[THINK\].*?\[/THINK\]', '', text, flags=re.DOTALL)
+        # Clean up extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    async def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
+        """Transcribe audio data using available STT services"""
+        try:
+            # Try faster-whisper first
+            if hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service:
+                return await self.app_context.faster_whisper_stt_service.transcribe_audio_data(audio_data)
+            
+            # Fallback to other STT services if available
+            if hasattr(self.app_context, 'qwen_omni_service') and self.app_context.qwen_omni_service:
+                # Use Qwen2.5-Omni for transcription
+                return await self._transcribe_with_omni(audio_data)
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error in transcribe_audio: {e}")
+            return None
+
+    async def _initialize_virtual_audio_capture(self):
+        """Initialize virtual audio capture for VB-Audio Virtual Cable."""
+        try:
+            self.logger.info("🎤 Initializing virtual audio capture...")
+            
+            # Initialize virtual audio if not already done
+            if not self.virtual_audio:
+                self.virtual_audio = WhisperAudioCapture(self.app_context, None)  # Disabled callback to prevent event loop errors
+                self.logger.info("✅ Virtual audio capture object created")
+            
+            # Get list of virtual audio devices
+            virtual_devices = self.virtual_audio.list_audio_devices()
+            self.logger.info(f"Found {len(virtual_devices)} virtual audio devices")
+            
+            if virtual_devices:
+                # Use the first VB-Audio device
+                selected_device_id, selected_device_name = virtual_devices[0]
+                self.logger.info(f"🎯 Using virtual audio device: {selected_device_name} (ID: {selected_device_id})")
+                
+                # Select the input device
+                if self.virtual_audio.select_input_device(selected_device_id):
+                    self.logger.info(f"✅ Selected virtual audio device: {selected_device_name}")
+                    
+                    # Initialize Whisper model with configured size from settings
+                    model_size = self.app_context.global_settings.get('WHISPER_MODEL_SIZE', 'medium')
+                    if await self.virtual_audio.initialize_whisper(model_size):
+                        self.logger.info("✅ Whisper model initialized successfully")
+                        
+                        # Start recording
+                        if self.virtual_audio.start_recording():
+                            self.logger.info("✅ Virtual audio capture started successfully")
+                            return True
+                        else:
+                            self.logger.error("❌ Failed to start virtual audio recording")
+                            return False
+                    else:
+                        self.logger.error("❌ Failed to initialize Whisper model")
+                        return False
+                else:
+                    self.logger.error(f"❌ Failed to select virtual audio device: {selected_device_name}")
+                    return False
+            else:
+                self.logger.warning("⚠️ No VB-Audio Virtual Cable devices found")
+                self.logger.info("💡 Install VB-Audio Virtual Cable for virtual audio capture")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize virtual audio capture: {e}")
+            return False
 
 # VADSink class removed - now using RawAudioReceiver for direct Opus packet capture
 
@@ -4009,19 +4562,44 @@ async def main():
             vlm_temperature=0.7,
             vlm_max_commentary_sentences=2,
             conversational_llm_model="qwen2.5:7b",
-            system_prompt_chat="You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. Use gamer lingo naturally, but explain anything arcane so newcomers feel included. Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding."
+            system_prompt_chat="You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. Use gamer lingo naturally, but explain anything arcane so newcomers feel included. Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.\n\nIMPORTANT: You are receiving voice transcriptions that may contain errors from speech-to-text processing. If a word or phrase seems out of context, unclear, or doesn't make sense, use your best judgment to interpret what the user likely meant based on the conversation context. Common STT errors include:\n- Homophones (e.g., 'there' vs 'their', 'to' vs 'too')\n- Similar-sounding words (e.g., 'game' vs 'gain', 'quest' vs 'test')\n- Missing or extra words\n- Punctuation errors\n- Background noise interpreted as words\n\nIf you're unsure about a transcription, you can ask for clarification, but try to respond naturally to what you believe the user intended to say."
         )
         app_context = AppContext(settings, discord_profile, logger)
 
         # Create the Discord bot with voice capabilities and full service integration
         bot = DanzarVoiceBot(settings, app_context)
+        
+        # Store bot instance in app context for services to access
+        app_context.discord_bot_runner_instance = bot
 
         # Start the bot
         logger.info("🎤 Starting DanzarAI Voice Bot with LLM and TTS integration...")
-        bot_token = settings.get('DISCORD_BOT_TOKEN', '')
+                # Load Discord bot token from environment variable
+        from dotenv import load_dotenv
+        load_dotenv()
+        
+        bot_token = os.environ.get('DISCORD_BOT_TOKEN')
         if not bot_token:
-            logger.error("❌ DISCORD_BOT_TOKEN is missing from configuration!")
+            logger.error("❌ DISCORD_BOT_TOKEN environment variable not set!")
             return
+        
+        # Load Discord voice channel ID from environment variable
+        voice_channel_id = os.environ.get('DISCORD_VOICE_CHANNEL_ID')
+        if voice_channel_id:
+            # Override the voice channel ID in settings
+            settings['DISCORD_VOICE_CHANNEL_ID'] = voice_channel_id
+            logger.info(f"🎯 Voice channel ID loaded from environment: {voice_channel_id}")
+        else:
+            logger.warning("⚠️ DISCORD_VOICE_CHANNEL_ID not set in environment, using config file value")
+        
+        # Load Discord text channel ID from environment variable
+        text_channel_id = os.environ.get('DISCORD_TEXT_CHANNEL_ID')
+        if text_channel_id:
+            # Override the text channel ID in settings
+            settings['DISCORD_TEXT_CHANNEL_ID'] = text_channel_id
+            logger.info(f"📝 Text channel ID loaded from environment: {text_channel_id}")
+        else:
+            logger.warning("⚠️ DISCORD_TEXT_CHANNEL_ID not set in environment, using config file value")
         
         logger.info(f"🔑 Attempting to connect with token: {bot_token[:20]}...")
         
@@ -4047,13 +4625,5 @@ async def main():
         logger.info("🔓 Single instance lock released")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"💥 Fatal error: {e}", exc_info=True)
-        sys.exit(1)
-    finally:
-        # Final cleanup
-        app_lock.release()
+    asyncio.run(main())
+

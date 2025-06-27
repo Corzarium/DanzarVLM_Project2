@@ -35,7 +35,6 @@ from .memory_service import MemoryEntry
 # from .rag_service import RAGService  # Temporarily disabled due to dependency issues
 from .model_client import ModelClient
 from .danzar_factcheck import FactCheckService
-from utils.error_logger import ErrorLogger
 from collections import defaultdict
 
 logger = logging.getLogger("DanzarVLM.LLMService")
@@ -102,8 +101,6 @@ class LLMService:
             self.logger.info("[LLMService] Using Agentic Memory and ReAct Agent from app_context")
         else:
             self.logger.info("[LLMService] Agentic Memory services not available in app_context")
-
-        self.error_logger = ErrorLogger()
 
         # Initialize knowledge base cleanup system
         self.cleanup_enabled = self.ctx.global_settings.get("RAG_CLEANUP_ENABLED", True)
@@ -211,131 +208,70 @@ class LLMService:
             self.logger.error(f"[LLMService] LLM API general error: {e}", exc_info=True)
             return None
 
-    def generate_vlm_commentary_from_frame(self, frame_bgr_np: np.ndarray):
-        profile = self.ctx.active_profile
-        gs = self.ctx.global_settings
+    async def generate_vlm_commentary_from_frame(self, frame_bgr_np: np.ndarray):
+        """Generate VLM commentary from a frame using the configured VLM model"""
         now = time.time()
-
+        
+        # Check if enough time has passed since last commentary
         if now - self.last_vlm_time < self.next_vlm_commentary_delay:
             return
-
-        if self.ctx.is_in_conversation.is_set():
-            convo_to = float(gs.get("CONVERSATION_TIMEOUT_S", 45.0))
-            if now - self.ctx.last_interaction_time < convo_to:
-                self.logger.debug("[LLMService] Pausing VLM: active conversation.")
-                return
-            else:
-                self.logger.info("[LLMService] Conversation timed out, VLM can resume.")
-                self.ctx.is_in_conversation.clear()
-                self.last_vlm_time = now 
-                self.next_vlm_commentary_delay = self._calculate_next_commentary_delay()
-                self.logger.debug(f"Reset VLM timer post-convo. Next: ~{self.next_vlm_commentary_delay:.1f}s.")
-                return
-
-        self.logger.info("[LLMService] Attempting VLM commentary...")
         
-        # --- Image Encoding, OCR, RAG for current context ---
-        # Detect if we're using a Qwen model
-        model_name = profile.vlm_model.lower()
-        is_qwen25vl = "qwen2.5-vl" in model_name.lower()
+        # Check if commentary is enabled
+        if not self.ctx.ndi_commentary_enabled.is_set():
+            return
         
-        # Check frame shape and dimensions
-        h, w = frame_bgr_np.shape[:2]
-        self.logger.info(f"[LLMService] Original image dimensions: {w}x{h}")
+        # Get current profile and settings
+        profile = self.ctx.active_profile
+        gs = self.ctx.global_settings
         
-        # Initialize new dimensions
-        new_w, new_h = w, h
-        
-        # Check if image is 4K or larger
-        is_4k = (w >= 3840 or h >= 2160)
-        if is_4k:
-            self.logger.warning(f"[LLMService] Detected 4K image ({w}x{h}). Will aggressively reduce size.")
-        
-        # Get configured max image size
-        configured_max_size = gs.get("VLM_MAX_IMAGE_SIZE", 512)  # Increased default to 512px
-        max_dim = int(configured_max_size)
-        self.logger.info(f"[LLMService] Using max image size: {max_dim}px")
-        
-        # Set JPEG quality - using higher quality settings
-        jpeg_quality = 85 if is_4k else 95  # Much higher quality settings
-        self.logger.info(f"[LLMService] Using JPEG quality: {jpeg_quality}")
+        # Convert frame to base64 JPEG
+        try:
+            import cv2
+            import base64
+            import io
+            from PIL import Image
             
-        # Resize image if needed
-        if w > max_dim or h > max_dim:
-            scale = max_dim / max(w, h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            frame_bgr_np = cv2.resize(frame_bgr_np, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)  # Using Lanczos for better quality
-            self.logger.info(f"[LLMService] Resized image to {new_w}x{new_h}")
-
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame_bgr_np, cv2.COLOR_BGR2RGB)
-        
-        # Base64 JPEG encoding with high quality settings
-        encode_params = [
-            cv2.IMWRITE_JPEG_QUALITY, jpeg_quality,
-            cv2.IMWRITE_JPEG_OPTIMIZE, 1,  # Enable JPEG optimization
-            cv2.IMWRITE_JPEG_PROGRESSIVE, 1  # Enable progressive JPEG for better quality
-        ]
-        _, jpeg_buffer = cv2.imencode('.jpg', frame_rgb, encode_params)
-        base64_jpeg = base64.b64encode(jpeg_buffer.tobytes()).decode('utf-8')
-        
-        # Log the size of the encoded image
-        jpeg_size_kb = len(base64_jpeg) / 1024
-        self.logger.info(f"[LLMService] Encoded JPEG size: {jpeg_size_kb:.1f}KB")
-        
-        # If the image is still too large, try to reduce it further but maintain high quality
-        max_size_kb = gs.get("VLM_MAX_IMAGE_SIZE_KB", 1000)  # Increased to 1MB
-        if jpeg_size_kb > max_size_kb:
-            self.logger.warning(f"[LLMService] Image size ({jpeg_size_kb:.1f}KB) exceeds maximum ({max_size_kb}KB). Reducing further.")
-            # Reduce dimensions by 25% instead of 50%
-            new_w = int(new_w * 0.75)
-            new_h = int(new_h * 0.75)
-            frame_bgr_np = cv2.resize(frame_bgr_np, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame_bgr_np, cv2.COLOR_BGR2RGB)
-            # Try encoding again with slightly lower quality but still high
-            jpeg_quality = max(80, jpeg_quality - 10)  # Reduce quality but not below 80
-            encode_params = [
-                cv2.IMWRITE_JPEG_QUALITY, jpeg_quality,
-                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
-                cv2.IMWRITE_JPEG_PROGRESSIVE, 1
-            ]
-            _, jpeg_buffer = cv2.imencode('.jpg', frame_rgb, encode_params)
-            base64_jpeg = base64.b64encode(jpeg_buffer.tobytes()).decode('utf-8')
-            jpeg_size_kb = len(base64_jpeg) / 1024
-            self.logger.info(f"[LLMService] After reduction - size: {jpeg_size_kb:.1f}KB, quality: {jpeg_quality}")
-        
-        # Prepare the message content
-        messages = []
-        system_prompt = getattr(profile, 'system_prompt_commentary', None)
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
             
-        # Create the user message with image
-        base_instruction = getattr(profile, 'user_prompt_template_commentary', "Analyze this image from {game_name}.")
-        if base_instruction:
-            instruction_text = base_instruction.format(
-                game_name=profile.game_name,
-                ocr_text="OCR disabled" if not getattr(profile, 'ocr_enabled', True) else ""
-            )
-        else:
-            instruction_text = f"Analyze this image from {profile.game_name}."
-
-        # Prepare the API payload
+            # Convert to PIL Image
+            pil_image = Image.fromarray(frame_rgb)
+            
+            # Convert to JPEG bytes
+            img_buffer = io.BytesIO()
+            pil_image.save(img_buffer, format='JPEG', quality=85)
+            img_bytes = img_buffer.getvalue()
+            
+            # Convert to base64
+            base64_jpeg = base64.b64encode(img_bytes).decode('utf-8')
+            
+        except Exception as e:
+            self.logger.error(f"Frame conversion error: {e}")
+            return
+        
+        # Prepare instruction text
+        instruction_text = profile.vlm_instruction_text or "Describe what you see in this gaming screenshot and provide helpful commentary or tips."
+        
+        # Prepare messages for the model
+        messages = [
+            {"role": "system", "content": "You are Danzar, an upbeat gaming assistant. Provide brief, helpful commentary about what you see in the game screenshot."},
+            {"role": "user", "content": instruction_text}
+        ]
+        
+        # Prepare payload based on VLM provider
         payload = {
-            "model": profile.vlm_model,
             "messages": messages,
             "temperature": float(profile.vlm_temperature),
             "max_tokens": int(profile.vlm_max_tokens),
+            "model": profile.vlm_model
         }
         
-        # Conditionally add images based on VLM_PROVIDER
         vlm_provider = gs.get("VLM_PROVIDER", "default").lower()
         if vlm_provider == "ollama":
             # Ollama expects images as a list of base64 strings in the 'images' field
             payload["images"] = [base64_jpeg]
             self.logger.debug(f"[LLMService] Sending payload formatted for Ollama VLM")
-            resp = self.model_client.generate(
+            resp = await self.model_client.generate(
                 messages=messages,
                 temperature=float(profile.vlm_temperature),
                 max_tokens=int(profile.vlm_max_tokens),
@@ -435,7 +371,22 @@ class LLMService:
                     try: temp_frame = self.ctx.frame_queue.get_nowait(); latest_frame_np = temp_frame; self.ctx.frame_queue.task_done()
                     except queue.Empty: break
                 if latest_frame_np is not None:
-                    if isinstance(latest_frame_np, np.ndarray): self.generate_vlm_commentary_from_frame(latest_frame_np)
+                    if isinstance(latest_frame_np, np.ndarray): 
+                        # Run async VLM commentary without blocking the loop
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                # Create task to run async method without blocking
+                                asyncio.create_task(self.generate_vlm_commentary_from_frame(latest_frame_np))
+                            else:
+                                # If no event loop, run in executor
+                                import concurrent.futures
+                                with concurrent.futures.ThreadPoolExecutor() as executor:
+                                    future = executor.submit(asyncio.run, self.generate_vlm_commentary_from_frame(latest_frame_np))
+                                    future.result(timeout=30)  # 30 second timeout
+                        except Exception as e:
+                            self.logger.error(f"VLM commentary task error: {e}")
                     else: self.logger.warning(f"Non-NumPy frame: {type(latest_frame_np)}")
             except Exception as e: self.logger.error(f"VLM loop error: {e}", exc_info=True)
             time.sleep(self.ctx.global_settings.get("VLM_LOOP_CHECK_INTERVAL_S", 1.0))
@@ -543,6 +494,9 @@ class LLMService:
         """Handle search/research requests using web search capabilities"""
         try:
             self.logger.info(f"[LLMService] Processing search/research request: '{query}'")
+            
+            # Generate TTS feedback for web search
+            self._generate_search_feedback_tts("searching the web")
             
             # Clean the query for web search
             search_query = self._extract_search_query(query)
@@ -997,180 +951,43 @@ Response style: Natural, conversational, and helpful."""
 
     async def handle_user_text_query(self, user_text: str, user_name: str = "User"):
         """
-        Handle user text query with comprehensive LLM processing including intent classification,
-        RAG search, web search, and fallback responses.
+        Handle user text query with optimized LLM-first processing.
+        The LLM decides if the input is a greeting, needs clarification, or should trigger RAG/search.
         """
         self.logger.info(f"[LLMService] Processing text query from {user_name}: '{user_text[:100]}...'")
         
         try:
-            # Check if Qwen2.5-Omni service is available and enabled
-            if hasattr(self.ctx, 'qwen_omni_service') and self.ctx.qwen_omni_service:
-                try:
-                    self.logger.info("[LLMService] Using Qwen2.5-Omni for response generation")
-                    response = await self.ctx.qwen_omni_service.generate_response(user_text)
-                    
-                    if response and len(response.strip()) > 0:
-                        # Store response in memory if available
-                        if self.memory_service:
-                            try:
-                                # Use the correct method name for storing interactions
-                                if hasattr(self.memory_service, 'store_interaction'):
-                                    self.memory_service.store_interaction(user_name, user_text, response)
-                                elif hasattr(self.memory_service, 'add_memory'):
-                                    self.memory_service.add_memory(user_text, response, user_name)
-                            except Exception as e:
-                                self.logger.warning(f"[LLMService] Could not store interaction in memory: {e}")
-                        
-                        return response
-                    else:
-                        self.logger.warning("[LLMService] Qwen2.5-Omni returned empty response, falling back to standard processing")
-                except Exception as e:
-                    self.logger.error(f"[LLMService] Qwen2.5-Omni error: {e}, falling back to standard processing")
-            
-            # Check if tool-aware LLM is enabled
-            use_tool_aware = self.ctx.global_settings.get('USE_TOOL_AWARE_LLM', False)
-            
-            if use_tool_aware and self.model_client:
-                self.logger.info("[LLMService] Using tool-aware LLM processing")
-                return await self._handle_tool_aware_query(user_text, user_name)
-            
-            # Standard processing - improved RAG-based response with multiple collections
-            if self.rag_service and self.model_client:
-                try:
-                    self.logger.info("[LLMService] Using standard RAG processing")
-                    
-                    # Determine which collections to search based on query content
-                    collections_to_search = ["danzar_knowledge"]
-                    
-                    # Add game-specific collections based on keywords
-                    text_lower = user_text.lower()
-                    if any(keyword in text_lower for keyword in ["everquest", "eq", "norrath", "kunark", "velious"]):
-                        collections_to_search.insert(0, "everquest")  # Search everquest first
-                    elif any(keyword in text_lower for keyword in ["wow", "world of warcraft", "azeroth"]):
-                        collections_to_search.insert(0, "wow")
-                    elif any(keyword in text_lower for keyword in ["rimworld", "rim world", "colony"]):
-                        collections_to_search.insert(0, "rimworld")
-                    
-                    docs = None
-                    collection_used = None
-                    
-                    # Try each collection until we find results
-                    for collection in collections_to_search:
-                        try:
-                            docs = self.rag_service.query(
-                                collection=collection,
-                                query_text=user_text,
-                                n_results=3
-                            )
-                            if docs:
-                                collection_used = collection
-                                self.logger.info(f"[LLMService] Found {len(docs)} results in collection '{collection}'")
-                                break
-                        except Exception as e:
-                            self.logger.warning(f"[LLMService] Failed to query collection '{collection}': {e}")
-                            continue
-                    
-                    if docs:
-                        # Extract text content from dictionary results
-                        context_texts = []
-                        for doc in docs[:2]:  # Use top 2 results
-                            if isinstance(doc, dict):
-                                text_content = doc.get("text", "") or doc.get("content", "") or str(doc)
-                                context_texts.append(text_content)
-                            else:
-                                context_texts.append(str(doc))
-                        
-                        context = "\n".join(context_texts)
-                        system_prompt = (
-                            f"You are Danzar, an upbeat gaming assistant. Answer based on the context provided from the {collection_used} knowledge base. "
-                            "Keep responses conversational and helpful."
-                        )
-                        
-                        messages = [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Context: {context}\n\nQuestion: {user_text}"}
-                        ]
-                        
-                        response = await self.model_client.generate(
-                            messages=messages,
-                            temperature=0.7,
-                            max_tokens=200,
-                            model=self.ctx.active_profile.conversational_llm_model
-                        )
-                        
-                        if response and response.strip():
-                            return response.strip()
-                    
-                    # No RAG results found - try web search if available
-                    self.logger.info("[LLMService] No RAG results found, attempting web search")
-                    
-                    # Check if we have a web search service available
-                    web_search_result = None
-                    if hasattr(self.ctx, 'fact_check_service') and self.ctx.fact_check_service:
-                        try:
-                            # Use the existing fact check service for web search
-                            import asyncio
-                            web_search_result = await asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: self.ctx.fact_check_service._search_web(user_text, fact_check=False)
-                            )
-                            
-                            if web_search_result and len(web_search_result.strip()) > 50:
-                                self.logger.info(f"[LLMService] Web search found {len(web_search_result)} chars of results")
-                                
-                                # Store search results in RAG for future learning
-                                try:
-                                    await self._store_search_results_in_rag(user_text, web_search_result, user_name)
-                                    self.logger.info(f"[LLMService] Stored web search results in RAG for future learning")
-                                except Exception as e:
-                                    self.logger.warning(f"[LLMService] Failed to store search results in RAG: {e}")
-                                
-                                # Generate response based on web search results
-                                web_system_prompt = (
-                                    "You are Danzar, an upbeat gaming assistant. Answer the user's question based on the web search results provided. "
-                                    "Keep responses conversational and helpful. If the web results don't fully answer the question, say so."
-                                )
-                                
-                                web_messages = [
-                                    {"role": "system", "content": web_system_prompt},
-                                    {"role": "user", "content": f"Web search results: {web_search_result[:1000]}\n\nQuestion: {user_text}"}
-                                ]
-                                
-                                web_response = await self.model_client.generate(
-                                    messages=web_messages,
-                                    temperature=0.7,
-                                    max_tokens=250,
-                                    model=self.ctx.active_profile.conversational_llm_model
-                                )
-                                
-                                if web_response and web_response.strip():
-                                    return f"🌐 {web_response.strip()}"
-                                    
-                        except Exception as e:
-                            self.logger.warning(f"[LLMService] Web search failed: {e}")
-                    
-                    # Final fallback if no RAG results and no web search
-                    fallback_messages = [
-                        {"role": "system", "content": "You are Danzar, an upbeat gaming assistant. Be helpful and encouraging. Admit when you don't know something and suggest the user could search for more information."},
-                        {"role": "user", "content": user_text}
-                    ]
-                    
-                    response = await self.model_client.generate(
-                        messages=fallback_messages,
-                        temperature=0.7,
-                        max_tokens=200,
-                        model=self.ctx.active_profile.conversational_llm_model
-                    )
-                    
-                    return response.strip() if response else "I'm here to help! What would you like to know about gaming?"
-                    
-                except Exception as e:
-                    self.logger.error(f"[LLMService] Error in standard processing: {e}")
-                    return "I'm having trouble processing that right now. Please try again!"
-            
-            # Final fallback
-            return "I'm processing your request..."
-            
+            # Minimal filtering for pure noise or extremely short utterances
+            text_lower = user_text.lower().strip()
+            if len(text_lower) < 2 or text_lower in ["um", "uh", "ah", "oh", "mm", "hmm", "hm", "eh", "er"]:
+                self.logger.info("[LLMService] Ignoring pure noise or too short utterance.")
+                return None
+
+            # Compose a system prompt that instructs the LLM to handle greetings, clarifications, and tool usage
+            system_prompt = (
+                "You are Danzar, an upbeat gaming assistant. "
+                "If the user greets you, respond with a friendly greeting. "
+                "If the user asks a question, answer it. "
+                "If the user's message is unclear or you need more information, politely ask for clarification. "
+                "If the user's request requires searching your knowledge base or the web, use the available tools and explain what you are doing."
+            )
+
+            # Prepare messages for the LLM
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ]
+
+            # Use the model client to generate a response
+            response = await self.model_client.generate(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=250,
+                model=self.ctx.active_profile.conversational_llm_model
+            )
+
+            return response.strip() if response else "I'm here to help! What would you like to know about gaming?"
+
         except Exception as e:
             self.logger.error(f"[LLMService] Error in handle_user_text_query: {e}", exc_info=True)
             return "I encountered an error processing your request. Please try again."
@@ -1548,7 +1365,7 @@ Respond naturally and conversationally."""
 
         # Make API call
         try:
-            response = await self.model_client.generate(
+            response = self.model_client.generate(
                 messages=messages,
                 temperature=0.2,
                 max_tokens=300,
@@ -2430,3 +2247,48 @@ Your response:"""
         if self.cleanup_thread and self.cleanup_thread.is_alive():
             self.cleanup_thread.join(timeout=5)
         self.logger.info("[LLMService] Knowledge base cleanup scheduler stopped")
+
+    def _generate_search_feedback_tts(self, search_type: str = "searching"):
+        """Generate TTS feedback for search operations"""
+        try:
+            # Try to get bot instance from app context
+            bot_instance = getattr(self.ctx, 'discord_bot_runner_instance', None)
+            if not bot_instance:
+                self.logger.debug("[LLMService] Bot instance not available for search feedback")
+                return
+            
+            # Check if TTS service is available
+            if not hasattr(bot_instance, 'tts_service') or not bot_instance.tts_service:
+                self.logger.debug("[LLMService] TTS service not available for search feedback")
+                return
+            
+            feedback_text = f"One second, {search_type}."
+            self.logger.info(f"[LLMService] Generating search feedback TTS: '{feedback_text}'")
+            
+            # Generate TTS audio using bot's TTS service
+            tts_audio = bot_instance.tts_service.generate_audio(feedback_text)
+            if tts_audio:
+                # Queue the audio for playback using bot's queue method
+                if hasattr(bot_instance, '_queue_tts_audio'):
+                    # Run in a separate thread to avoid blocking
+                    import threading
+                    def queue_audio():
+                        try:
+                            import asyncio
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(bot_instance._queue_tts_audio(tts_audio))
+                            loop.close()
+                        except Exception as e:
+                            self.logger.warning(f"[LLMService] Failed to queue search feedback TTS: {e}")
+                    
+                    thread = threading.Thread(target=queue_audio, daemon=True)
+                    thread.start()
+                    self.logger.info(f"[LLMService] Search feedback TTS queued ({len(tts_audio)} bytes)")
+                else:
+                    self.logger.warning("[LLMService] TTS queue method not available")
+            else:
+                self.logger.warning("[LLMService] Failed to generate search feedback TTS")
+                
+        except Exception as e:
+            self.logger.warning(f"[LLMService] Error generating search feedback TTS: {e}")

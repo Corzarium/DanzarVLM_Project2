@@ -69,16 +69,16 @@ class VoiceChatService:
             self.logger.info(f"[VoiceChatService] VAD initialized with mode {vad_mode}")
             
             # Initialize Whisper model
-            whisper_model_size = self.config.get('WHISPER_MODEL_SIZE', 'base.en')
+            whisper_model_size = 'medium'  # Force Whisper model to always use medium
             self.whisper_model = whisper.load_model(whisper_model_size)
             self.logger.info(f"[VoiceChatService] Whisper model '{whisper_model_size}' loaded")
             
-            # Initialize OpenAI client for LM Studio
-            llm_endpoint = self.config.get('LLM_SERVER', {}).get('endpoint', 'http://localhost:1234/v1')
+            # Initialize OpenAI client for llama.cpp server
+            llm_endpoint = self.config.get('LLM_SERVER', {}).get('endpoint', 'http://localhost:8080/v1')
             
             self.openai_client = openai.AsyncOpenAI(
                 base_url=llm_endpoint,
-                api_key="not-needed"  # LM Studio doesn't require API key
+                api_key="not-needed"  # llama.cpp server doesn't require API key
             )
             self.logger.info(f"[VoiceChatService] OpenAI client initialized for {llm_endpoint}")
             
@@ -235,7 +235,7 @@ class VoiceChatService:
                     return self._strip_think_tags(response)
                 return None
             
-            # Fallback to direct OpenAI call (LM Studio)
+            # Fallback to direct OpenAI call (llama.cpp server)
             if not self.openai_client:
                 self.logger.error("[VoiceChatService] No LLM service available")
                 return None
@@ -248,7 +248,7 @@ class VoiceChatService:
             # Get model name from config
             model_name = self.config.get('DEFAULT_CONVERSATIONAL_LLM_MODEL', 'mimo-vl-7b-rl')
             
-            # Make request to LM Studio
+            # Make request to llama.cpp server
             response = await self.openai_client.chat.completions.create(
                 model=model_name,
                 messages=messages,

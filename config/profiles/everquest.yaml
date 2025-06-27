@@ -15,6 +15,16 @@ vlm_settings:
   vlm_temperature: 0.3  # Lower for more focused reasoning
   vlm_max_commentary_sentences: 5  # Allow more detailed responses
 
+# --- Vision Analysis Prompts (for Simple Vision screenshot analysis) ---
+vision_prompts:
+  action: "What EverQuest action is happening in this screenshot? Look for combat with monsters, spellcasting, meditation, looting, or player movement. Describe the specific EverQuest activity taking place."
+  ui: "Describe the EverQuest UI elements visible: health/mana bars, chat windows, inventory, spellbook, target windows, or hotbars. What information is displayed in the EverQuest interface?"
+  scene: "What EverQuest zone or environment is shown? Describe the setting: dungeon, outdoor zone, city, or specific landmark. What type of EverQuest location is this?"
+  character: "Describe the EverQuest characters visible: player character class (warrior, wizard, cleric, etc.), NPCs, monsters, or other players. What EverQuest entities are in the scene?"
+  combat: "Analyze the EverQuest combat situation: who is fighting whom, health levels, spell effects, or combat status. What's happening in this EverQuest battle?"
+  everquest: "Provide detailed EverQuest analysis: identify the character class, current zone, combat status, group situation, and any important EverQuest gameplay elements visible. Give specific EverQuest context."
+  quick: "Briefly describe this EverQuest gameplay screenshot in 1-2 sentences, focusing on the main EverQuest activity or situation."
+
 prompts:
   # General system prompt (can be overridden by system_prompt_commentary or system_prompt_chat)
   system_prompt: |
@@ -58,6 +68,15 @@ prompts:
     Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.
     
     If you don't know the answer based on the provided context, stay positive and let them know you're searching for more information!
+    
+    IMPORTANT: You are receiving voice transcriptions that may contain errors from speech-to-text processing. If a word or phrase seems out of context, unclear, or doesn't make sense, use your best judgment to interpret what the user likely meant based on the conversation context. Common STT errors include:
+    - Homophones (e.g., 'there' vs 'their', 'to' vs 'too')
+    - Similar-sounding words (e.g., 'game' vs 'gain', 'quest' vs 'test')
+    - Missing or extra words
+    - Punctuation errors
+    - Background noise interpreted as words
+    
+    If you're unsure about a transcription, you can ask for clarification, but try to respond naturally to what you believe the user intended to say.
 
   conversational_max_tokens: 16384  # Maximum for DeepSeek-R1 reasoning model's full output
   conversational_temperature: 0.4  # Lower temperature for more focused reasoning

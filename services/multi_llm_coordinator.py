@@ -73,7 +73,7 @@ class MultiLLMCoordinator:
 
     def _initialize_llm_nodes(self):
         """Initialize specialized LLM nodes with different models and configurations"""
-        base_url = self.ctx.global_settings.get("LLAMA_API_BASE_URL", "http://localhost:1234")
+        base_url = self.ctx.global_settings.get("LLAMA_API_BASE_URL", "http://localhost:8080")
         
         # Coordinator LLM - Fast, reliable for planning and intent classification
         coordinator_model = self.ctx.global_settings.get("COORDINATOR_MODEL", "qwen2.5:3b")

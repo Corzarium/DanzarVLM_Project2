@@ -4,6 +4,9 @@ numpy==1.26.4
 requests==2.32.3
 python-dotenv==1.1.0
 
+# Fix pkg_resources deprecation warning
+setuptools==80.9.0
+
 # AI/ML dependencies
 torch==2.1.2
 torchvision==0.16.2

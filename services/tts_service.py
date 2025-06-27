@@ -411,6 +411,55 @@ class TTSService:
             self.logger.error("[TTSService] ❌ All streaming chunks failed to generate")
         
         return success
+    
+    async def generate_audio_concurrent(self, sentences: list[str]) -> list[tuple[int, bytes]]:
+        """
+        Generate TTS for multiple sentences concurrently for maximum performance.
+        
+        Args:
+            sentences: List of sentence strings to convert to speech
+            
+        Returns:
+            List of tuples (index, audio_data) in order of completion
+        """
+        import asyncio
+        import concurrent.futures
+        from threading import ThreadPoolExecutor
+        
+        if not sentences:
+            return []
+        
+        max_workers = getattr(self, 'max_concurrent_requests', 2)
+        results = []
+        
+        # Use ThreadPoolExecutor for concurrent TTS generation
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all TTS generation tasks
+            future_to_index = {
+                executor.submit(self._generate_single_audio, sentence): i
+                for i, sentence in enumerate(sentences)
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    audio_data = future.result(timeout=15)  # 15 second timeout per request
+                    if audio_data:
+                        results.append((index, audio_data))
+                        self.logger.info(f"[TTSService] ✅ Concurrent TTS completed for sentence {index + 1}")
+                    else:
+                        self.logger.warning(f"[TTSService] Failed to generate TTS for sentence {index + 1}")
+                except concurrent.futures.TimeoutError:
+                    self.logger.error(f"[TTSService] Timeout generating TTS for sentence {index + 1}")
+                except Exception as e:
+                    self.logger.error(f"[TTSService] Error generating TTS for sentence {index + 1}: {e}")
+        
+        # Sort results by original index to maintain order
+        results.sort(key=lambda x: x[0])
+        self.logger.info(f"[TTSService] Concurrent TTS generation completed: {len(results)}/{len(sentences)} successful")
+        
+        return results
 
     def _create_streaming_chunks(self, text: str) -> List[str]:
         """

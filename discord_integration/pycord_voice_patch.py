@@ -53,7 +53,7 @@ class PycordVoiceBot(commands.Bot):
     def _load_whisper_model(self):
         """Load Whisper model for STT processing"""
         try:
-            model_size = self.settings.get('WHISPER_MODEL_SIZE', 'base.en')
+            model_size = 'medium'  # Force Whisper model to always use medium
             self.whisper_model = whisper.load_model(model_size)
             self.logger.info(f"[PycordVoiceBot] Whisper model '{model_size}' loaded")
         except Exception as e:

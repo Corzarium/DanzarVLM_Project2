@@ -1,0 +1,27 @@
+# Danzar Voice Pipeline Dependencies
+
+# Core Discord and async
+discord.py>=2.3.0
+aiohttp>=3.8.0
+asyncio
+
+# Audio processing
+numpy>=1.21.0
+torch>=2.0.0
+torchaudio>=2.0.0
+soundfile>=0.12.0
+
+# Speech recognition and analysis
+openai-whisper>=20231117
+speechbrain>=0.5.16
+transformers>=4.30.0
+
+# Laughter detection
+torch-hub
+
+# Environment and utilities
+python-dotenv>=1.0.0
+dataclasses-json>=0.6.0
+
+# Optional: GPU acceleration
+# torch-cuda  # Uncomment if using CUDA 

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Faster-Whisper Speech-to-Text Service for DanzarAI
-Provides ultra-fast, accurate speech recognition with GPU acceleration
-Up to 4x faster than OpenAI Whisper with same accuracy
+Whisper STT Service Client for DanzarVLM
+Provides speech-to-text by calling external Whisper STT server
 """
 
 import logging
@@ -10,154 +9,170 @@ import os
 import tempfile
 import time
 import wave
+import base64
+import io
+import asyncio
+import aiohttp
+import json
 from typing import Optional, Dict, Any, Union
 import numpy as np
 
-try:
-    from faster_whisper import WhisperModel
-    FASTER_WHISPER_AVAILABLE = True
-except ImportError:
-    FASTER_WHISPER_AVAILABLE = False
-    WhisperModel = None
-
-
-class FasterWhisperSTTService:
-    """Ultra-fast offline speech-to-text service using faster-whisper with CTranslate2."""
+class WhisperSTTService:
+    """Client service for Whisper STT via external server"""
     
-    def __init__(self, app_context, model_size: str = "large", device: str = "auto"):
+    def __init__(self, app_context, model_size: str = "base"):
         self.app_context = app_context
         self.logger = app_context.logger
         
-        # Model configuration - upgraded to large for maximum accuracy
+        # Server configuration
+        self.server_endpoint = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('endpoint', 'http://localhost:8084/transcribe')
+        self.server_timeout = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('timeout', 30)
+        self.server_enabled = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('enabled', True)
+        
+        # Model configuration
         self.model_size = model_size
-        self.device = device
-        self.model = None
         
-        # Audio settings optimized for real-time processing
-        self.sample_rate = 16000  # faster-whisper works best with 16kHz
+        # Audio settings
+        self.sample_rate = 16000
         
-        # Performance settings - optimized for Discord's compressed audio
-        self.confidence_threshold = 0.05  # Lower for Discord's compressed audio (was 0.1)
-        self.min_speech_length = 0.2     # Minimum speech duration (was 0.3)
+        # HTTP session
+        self.session = None
+        self.server_available = False
         
-        # Transcription parameters optimized for higher accuracy
-        self.transcribe_params = {
-            "language": "en",
-            "task": "transcribe",
-            "beam_size": 3,  # Increased from 1 for better accuracy
-            "best_of": 3,    # Increased from 1 for better accuracy
-            "temperature": [0.0, 0.2, 0.4],  # Multiple temperatures for better results
-            "condition_on_previous_text": False,  # Prevent context bias
-            "initial_prompt": None,  # No prompt bias
-            "word_timestamps": False,  # Disable for speed
-            "prepend_punctuations": "\"'¿([{-",
-            "append_punctuations": "\"'.。,，!！?？:：\")]}、",
-            "vad_filter": False,  # DISABLE built-in VAD - use our own speech detection
-            "vad_parameters": None,  # Not needed when VAD is disabled
-            "compression_ratio_threshold": 2.0,  # Lower threshold for better quality
-            "logprob_threshold": -0.5,  # More lenient for better recall
-            "no_speech_threshold": 0.8   # Higher threshold to reduce false positives
-        }
+        self.logger.info(f"[WhisperSTTService] Initializing client for model: {model_size}")
+        self.logger.info(f"[WhisperSTTService] Server endpoint: {self.server_endpoint}")
         
-        self.logger.info(f"[FasterWhisperSTTService] Initializing with model: {model_size}, device: {device}")
-        
-    def initialize(self) -> bool:
-        """Initialize the faster-whisper model."""
-        if not FASTER_WHISPER_AVAILABLE:
-            self.logger.error("❌ faster-whisper not available - install with: pip install faster-whisper")
-            return False
-            
+    async def initialize(self) -> bool:
+        """Initialize the Whisper STT service client"""
         try:
-            # Determine optimal device and compute type
-            device, compute_type = self._get_optimal_device_config()
+            if not self.server_enabled:
+                self.logger.warning("Whisper STT server is disabled in configuration")
+                return False
+                
+            self.logger.info(f"🚀 Initializing Whisper STT service client...")
             
-            self.logger.info(f"🔧 Loading faster-whisper model '{self.model_size}' on {device} with {compute_type}")
-            
-            # Load model with optimal settings
-            self.model = WhisperModel(
-                self.model_size,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=4,  # Optimal for most systems
-                num_workers=1   # Single worker for real-time processing
+            # Create HTTP session
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.server_timeout)
             )
             
-            self.logger.info("✅ faster-whisper STT service initialized successfully")
+            # Test server connectivity
+            await self._test_server_connection()
             
-            # Test transcription to warm up the model
-            self._warmup_model()
-            
-            return True
+            if self.server_available:
+                self.logger.info("✅ Whisper STT service client initialized successfully")
+                return True
+            else:
+                self.logger.error("❌ Failed to connect to Whisper STT server")
+                return False
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to initialize faster-whisper STT: {e}")
+            self.logger.error(f"❌ Failed to initialize Whisper STT service client: {e}")
             return False
     
-    def _get_optimal_device_config(self) -> tuple[str, str]:
-        """Determine optimal device and compute type configuration."""
-        if self.device == "auto":
-            # Auto-detect best configuration
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    device = "cuda"
-                    compute_type = "float16"  # Best balance of speed/accuracy on GPU
-                    self.logger.info("🚀 Using GPU acceleration with FP16")
-                else:
-                    device = "cpu"
-                    compute_type = "int8"  # Fastest on CPU
-                    self.logger.info("🔧 Using CPU with INT8 quantization")
-            except ImportError:
-                device = "cpu"
-                compute_type = "int8"
-                self.logger.info("🔧 Using CPU with INT8 quantization (torch not available)")
-        else:
-            device = self.device
-            if device == "cuda":
-                compute_type = "float16"
-            else:
-                compute_type = "int8"
-        
-        return device, compute_type
-    
-    def _warmup_model(self):
-        """Warm up the model with a short audio sample."""
+    async def _test_server_connection(self):
+        """Test connection to the external server"""
         try:
-            # Create a short silence for warmup
-            warmup_audio = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
-            
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                # Save as WAV
-                try:
-                    import scipy.io.wavfile as wavfile
-                    audio_int16 = (warmup_audio * 32767).astype(np.int16)
-                    wavfile.write(temp_file.name, self.sample_rate, audio_int16)
-                except ImportError:
-                    import wave
-                    with wave.open(temp_file.name, 'wb') as wav_file:
-                        wav_file.setnchannels(1)
-                        wav_file.setsampwidth(2)
-                        wav_file.setframerate(self.sample_rate)
-                        audio_int16 = (warmup_audio * 32767).astype(np.int16)
-                        wav_file.writeframes(audio_int16.tobytes())
+            if not self.session:
+                return
                 
-                temp_path = temp_file.name
-            
-            # Run warmup transcription
-            segments, _ = self.model.transcribe(temp_path, **self.transcribe_params)
-            list(segments)  # Force execution
-            
-            # Cleanup
-            os.unlink(temp_path)
-            
-            self.logger.info("🔥 Model warmed up successfully")
-            
+            # Try to get server health status
+            async with self.session.get(f"{self.server_endpoint.replace('/transcribe', '/health')}") as response:
+                if response.status == 200:
+                    self.server_available = True
+                    self.logger.info("✅ Whisper STT server is available")
+                else:
+                    self.server_available = False
+                    self.logger.warning(f"⚠️ Whisper STT server health check failed: {response.status}")
+                    
         except Exception as e:
-            self.logger.warning(f"⚠️ Model warmup failed (not critical): {e}")
+            self.server_available = False
+            self.logger.warning(f"⚠️ Could not connect to Whisper STT server: {e}")
     
-    def transcribe_audio_data(self, audio_data: np.ndarray) -> Optional[str]:
+    async def _call_server(self, audio_data: np.ndarray, language: str = "en", task: str = "transcribe") -> str:
         """
-        Enhanced transcription with intelligent audio chunking for long segments.
+        Call the external Whisper STT server
+        
+        Args:
+            audio_data: Audio data as numpy array
+            language: Language code
+            task: Transcription task (transcribe/translate)
+            
+        Returns:
+            Transcribed text
+        """
+        try:
+            if not self.server_available or not self.session:
+                return "Error: Server not available"
+            
+            # Convert audio to WAV bytes
+            audio_bytes = self._numpy_to_wav_bytes(audio_data)
+            if not audio_bytes:
+                return "Error: Failed to convert audio to WAV"
+            
+            # Prepare multipart form data with file upload
+            form_data = aiohttp.FormData()
+            form_data.add_field('file', audio_bytes, 
+                              filename='audio.wav',
+                              content_type='audio/wav')
+            form_data.add_field('language', language)
+            form_data.add_field('task', task)
+            
+            # Make the request
+            async with self.session.post(
+                self.server_endpoint,
+                data=form_data
+            ) as response:
+                
+                if response.status == 200:
+                    result = await response.json()
+                    if "transcription" in result:
+                        return result["transcription"].strip()
+                    else:
+                        return "Error: Invalid response format from server"
+                else:
+                    error_text = await response.text()
+                    self.logger.error(f"Server error {response.status}: {error_text}")
+                    return f"Error: Server returned status {response.status}"
+                    
+        except asyncio.TimeoutError:
+            self.logger.error("Timeout calling Whisper STT server")
+            return "Error: Server timeout"
+        except Exception as e:
+            self.logger.error(f"❌ Error calling Whisper STT server: {e}")
+            return f"Error: {str(e)}"
+    
+    def _numpy_to_wav_bytes(self, audio_data: np.ndarray) -> Optional[bytes]:
+        """Convert numpy audio array to WAV bytes"""
+        try:
+            # Ensure audio is float32 and normalized
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Normalize if needed
+            if np.max(np.abs(audio_data)) > 1.0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
+            
+            # Convert to int16
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            
+            # Create WAV file in memory
+            with io.BytesIO() as wav_buffer:
+                with wave.open(wav_buffer, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(self.sample_rate)
+                    wav_file.writeframes(audio_int16.tobytes())
+                
+                return wav_buffer.getvalue()
+                
+        except Exception as e:
+            self.logger.error(f"Error converting audio to WAV: {e}")
+            return None
+    
+    async def transcribe_audio_data(self, audio_data: np.ndarray) -> Optional[str]:
+        """
+        Transcribe audio data using external Whisper STT server
         
         Args:
             audio_data: Audio data as numpy array (16kHz, mono, float32)
@@ -166,8 +181,8 @@ class FasterWhisperSTTService:
             Transcribed text or None if no speech detected
         """
         try:
-            if not self.model:
-                self.logger.error("❌ Whisper model not initialized")
+            if not self.server_available:
+                self.logger.error("❌ Whisper STT server not available")
                 return None
             
             # Basic audio analysis
@@ -177,507 +192,128 @@ class FasterWhisperSTTService:
             
             self.logger.info(f"🎵 Audio analysis - Duration: {audio_duration:.2f}s, Max: {audio_max_volume:.4f}, RMS: {audio_rms:.4f}")
             
-            # Spectral analysis for speech detection
-            try:
-                from scipy import signal
-                f, Pxx = signal.welch(audio_data, self.sample_rate, nperseg=1024)
+            # Check for silence
+            if audio_rms < 0.01:
+                self.logger.info("🔇 Audio too quiet, likely silence")
+                return None
+            
+            # Call external server
+            result = await self._call_server(audio_data, language="en", task="transcribe")
+            
+            if result.startswith("Error:"):
+                self.logger.error(f"❌ Transcription failed: {result}")
+                return None
+            
+            # Clean up transcription
+            cleaned_result = self._clean_transcription(result)
+            
+            if cleaned_result and len(cleaned_result.strip()) > 0:
+                self.logger.info(f"✅ Transcription successful: '{cleaned_result}'")
+                return cleaned_result
+            else:
+                self.logger.info("🔇 No speech detected in audio")
+                return None
                 
-                # Calculate spectral centroid (weighted average frequency)
-                spectral_centroid = np.sum(f * Pxx) / np.sum(Pxx)
-                
-                # Calculate energy in speech frequency range (300-3400 Hz)
-                speech_mask = (f >= 300) & (f <= 3400)
-                speech_energy = np.sum(Pxx[speech_mask])
-                total_energy = np.sum(Pxx)
-                speech_ratio = speech_energy / (total_energy + 1e-8)
-                
-                # Zero crossing rate
-                zero_crossings = np.where(np.diff(np.signbit(audio_data)))[0]
-                zcr = len(zero_crossings) / len(audio_data)
-                
-            except ImportError:
-                # Fallback without scipy
-                spectral_centroid = 1000  # Assume reasonable value
-                speech_ratio = 0.5
-                zcr = 0.1
-            
-            self.logger.info(f"🎵 Spectral analysis - Centroid: {spectral_centroid:.0f}Hz, Speech ratio: {speech_ratio:.3f}, ZCR: {zcr:.4f}")
-            
-            # ENHANCED quality checks with chunking support
-            
-            # 1. Volume thresholds
-            if audio_max_volume < 0.12:
-                self.logger.info(f"🔇 Audio volume too low for speech (max: {audio_max_volume:.4f} < 0.12)")
-                return None
-            
-            if audio_rms < 0.025:
-                self.logger.info(f"🔇 Audio RMS too low for speech (RMS: {audio_rms:.4f} < 0.025)")
-                return None
-            
-            # 2. Duration checks with chunking support
-            if audio_duration < 0.8:
-                self.logger.info(f"🔇 Audio too short for meaningful speech ({audio_duration:.2f}s < 0.8s)")
-                return None
-            
-            # NEW: Handle long audio with intelligent chunking
-            if audio_duration > 15.0:  # Increased from 10.0s to 15.0s
-                self.logger.info(f"🔄 Audio segment long ({audio_duration:.2f}s), using intelligent chunking")
-                return self._transcribe_with_chunking(audio_data)
-            
-            # 3. Spectral analysis for speech detection
-            if spectral_centroid < 200 or spectral_centroid > 4000:
-                self.logger.info(f"🔇 Spectral centroid outside speech range ({spectral_centroid:.0f}Hz)")
-                return None
-            
-            if speech_ratio < 0.3:
-                self.logger.info(f"🔇 Insufficient energy in speech frequencies ({speech_ratio:.3f} < 0.3)")
-                return None
-            
-            # 4. Zero crossing rate
-            if zcr < 0.01 or zcr > 0.3:
-                self.logger.info(f"🔇 Zero crossing rate outside speech range ({zcr:.4f})")
-                return None
-            
-            # 5. Signal-to-noise ratio estimation
-            snr_proxy = audio_max_volume / (audio_rms + 1e-8)
-            if snr_proxy < 3.0:
-                self.logger.info(f"🔇 Poor signal-to-noise ratio ({snr_proxy:.2f} < 3.0)")
-                return None
-            
-            self.logger.info(f"✅ Audio passed quality checks - proceeding with transcription")
-            
-            # Use the working file-based transcription approach
-            return self._transcribe_single_segment(audio_data)
-            
         except Exception as e:
             self.logger.error(f"❌ Transcription error: {e}")
             return None
-
-    def _transcribe_with_chunking(self, audio_data: np.ndarray) -> Optional[str]:
-        """
-        Transcribe long audio by splitting into intelligent chunks.
+    
+    def _clean_transcription(self, text: str) -> str:
+        """Clean up transcription text"""
+        if not text:
+            return ""
         
-        Args:
-            audio_data: Long audio segment to chunk and transcribe
-            
-        Returns:
-            Combined transcription from all chunks
-        """
-        try:
-            audio_duration = len(audio_data) / self.sample_rate
-            self.logger.info(f"🔄 Chunking audio segment: {audio_duration:.2f}s")
-            
-            # Split into overlapping chunks for better continuity
-            chunk_duration = 10.0  # 10 second chunks
-            overlap_duration = 2.0  # 2 second overlap
-            
-            chunk_samples = int(chunk_duration * self.sample_rate)
-            overlap_samples = int(overlap_duration * self.sample_rate)
-            step_samples = chunk_samples - overlap_samples
-            
-            chunks = []
-            transcriptions = []
-            
-            # Create chunks with overlap
-            start = 0
-            chunk_num = 0
-            while start < len(audio_data):
-                end = min(start + chunk_samples, len(audio_data))
-                chunk = audio_data[start:end]
-                
-                # Only process chunks that are long enough
-                chunk_duration_actual = len(chunk) / self.sample_rate
-                if chunk_duration_actual >= 1.0:  # At least 1 second
-                    chunks.append((chunk_num, chunk, start / self.sample_rate))
-                    chunk_num += 1
-                
-                start += step_samples
-                if end >= len(audio_data):
-                    break
-            
-            self.logger.info(f"🔄 Created {len(chunks)} chunks for processing")
-            
-            # Process each chunk
-            for chunk_num, chunk_audio, start_time in chunks:
-                try:
-                    self.logger.info(f"🔄 Processing chunk {chunk_num + 1}/{len(chunks)} (start: {start_time:.1f}s)")
-                    
-                    # Transcribe this chunk
-                    chunk_transcription = self._transcribe_single_segment(chunk_audio)
-                    
-                    if chunk_transcription and len(chunk_transcription.strip()) > 0:
-                        # Clean up the transcription
-                        chunk_transcription = chunk_transcription.strip()
-                        
-                        # Avoid duplicate phrases from overlapping chunks
-                        if not self._is_duplicate_content(chunk_transcription, transcriptions):
-                            transcriptions.append(chunk_transcription)
-                            self.logger.info(f"✅ Chunk {chunk_num + 1} transcription: '{chunk_transcription}'")
-                        else:
-                            self.logger.info(f"🔄 Chunk {chunk_num + 1} skipped (duplicate content)")
-                    else:
-                        self.logger.info(f"🔇 Chunk {chunk_num + 1} produced no transcription")
-                        
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Error processing chunk {chunk_num + 1}: {e}")
-                    continue
-            
-            # Combine transcriptions intelligently
-            if transcriptions:
-                # Join with spaces and clean up
-                combined = " ".join(transcriptions)
-                combined = self._clean_combined_transcription(combined)
-                
-                self.logger.info(f"✅ Combined chunked transcription: '{combined}'")
-                return combined
-            else:
-                self.logger.info("🔇 No valid transcriptions from any chunks")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error in chunked transcription: {e}")
-            return None
-
-    def _transcribe_single_segment(self, audio_data: np.ndarray) -> Optional[str]:
-        """
-        Transcribe a single audio segment using file-based approach.
-        
-        Args:
-            audio_data: Audio segment to transcribe
-            
-        Returns:
-            Transcription text or None
-        """
-        try:
-            # Use the working file-based transcription approach
-            self.logger.info("🎯 Using working file-based transcription...")
-            
-            # Save audio to temporary WAV file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                temp_file_path = temp_file.name
-            
-            # Convert to 16-bit PCM WAV
-            audio_int16 = np.clip(audio_data * 32767, -32767, 32767).astype(np.int16)
-            
-            import scipy.io.wavfile as wavfile
-            wavfile.write(temp_file_path, self.sample_rate, audio_int16)
-            
-            self.logger.info(f"🎵 Transcribing file: {temp_file_path}")
-            
-            # Use simple, working parameters with hallucination suppression
-            simple_params = {
-                "language": "en",
-                "task": "transcribe",
-                "beam_size": 1,
-                "best_of": 1,
-                "temperature": 0.0,
-                "condition_on_previous_text": False,
-                "word_timestamps": False,
-                "vad_filter": False,
-                "suppress_tokens": [-1]
-            }
-            
-            # Transcribe with simple, working parameters
-            start_time = time.time()
-            segments, info = self.model.transcribe(
-                temp_file_path,
-                **simple_params
-            )
-            
-            # Clean up temporary file
-            os.unlink(temp_file_path)
-            
-            # Collect all segments
-            transcription_parts = []
-            for segment in segments:
-                if segment.text.strip():
-                    transcription_parts.append(segment.text.strip())
-            
-            processing_time = time.time() - start_time
-            
-            if transcription_parts:
-                full_transcription = " ".join(transcription_parts)
-                
-                # Check for hallucinations
-                audio_duration = len(audio_data) / self.sample_rate
-                audio_rms = np.sqrt(np.mean(np.square(audio_data)))
-                
-                if self._is_likely_hallucination(full_transcription, audio_duration, audio_rms):
-                    self.logger.info(f"🚫 Filtered out likely hallucination: '{full_transcription}'")
-                    return None
-                
-                self.logger.info(f"✅ File transcription: '{full_transcription}'")
-                self.logger.info(f"📊 Language: {info.language} (confidence: {info.language_probability:.3f})")
-                return full_transcription
-            else:
-                self.logger.info("🔇 No speech detected in file")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Single segment transcription error: {e}")
-            return None
-
-    def _is_duplicate_content(self, new_transcription: str, existing_transcriptions: list) -> bool:
-        """
-        Check if new transcription is duplicate content from overlapping chunks.
-        
-        Args:
-            new_transcription: New transcription to check
-            existing_transcriptions: List of existing transcriptions
-            
-        Returns:
-            True if content appears to be duplicate
-        """
-        if not existing_transcriptions:
-            return False
-        
-        new_words = set(new_transcription.lower().split())
-        
-        # Check against recent transcriptions (last 2)
-        for existing in existing_transcriptions[-2:]:
-            existing_words = set(existing.lower().split())
-            
-            # Calculate word overlap
-            if len(new_words) > 0 and len(existing_words) > 0:
-                overlap = len(new_words.intersection(existing_words))
-                overlap_ratio = overlap / min(len(new_words), len(existing_words))
-                
-                # If more than 70% word overlap, consider duplicate
-                if overlap_ratio > 0.7:
-                    return True
-        
-        return False
-
-    def _clean_combined_transcription(self, combined: str) -> str:
-        """
-        Clean up combined transcription from multiple chunks.
-        
-        Args:
-            combined: Raw combined transcription
-            
-        Returns:
-            Cleaned transcription
-        """
         # Remove extra whitespace
-        combined = " ".join(combined.split())
+        text = " ".join(text.split())
         
         # Remove common transcription artifacts
-        artifacts = [
-            " . ", " , ", " ? ", " ! ",
-            "  ", "   "  # Multiple spaces
-        ]
+        text = text.replace("[BLANK_AUDIO]", "")
+        text = text.replace("[MUSIC]", "")
+        text = text.replace("[NOISE]", "")
         
-        for artifact in artifacts:
-            combined = combined.replace(artifact, " ")
+        # Remove timestamps if present
+        import re
+        text = re.sub(r'\[\d+:\d+\.\d+\]', '', text)
         
-        # Capitalize first letter
-        if combined:
-            combined = combined[0].upper() + combined[1:] if len(combined) > 1 else combined.upper()
-        
-        return combined.strip()
-
-    def _preprocess_discord_audio(self, audio_data: np.ndarray, original_sample_rate: int) -> np.ndarray:
-        """Enhanced preprocessing specifically for Discord's compressed audio."""
-        try:
-            # Resample to 16kHz if needed
-            if original_sample_rate != self.sample_rate:
-                resample_ratio = self.sample_rate / original_sample_rate
-                target_length = int(len(audio_data) * resample_ratio)
-                indices = np.linspace(0, len(audio_data) - 1, target_length)
-                audio_16k = np.interp(indices, np.arange(len(audio_data)), audio_data)
-            else:
-                audio_16k = audio_data.copy()
-            
-            # Discord audio corruption fixes
-            try:
-                from scipy import signal
-                
-                # 1. Remove DC offset
-                audio_16k = audio_16k - np.mean(audio_16k)
-                
-                # 2. Pre-emphasis for Discord compression
-                pre_emphasis = 0.97
-                if len(audio_16k) > 1:
-                    audio_16k = np.append(audio_16k[0], audio_16k[1:] - pre_emphasis * audio_16k[:-1])
-                
-                # 3. Bandpass filter for speech (300-3400 Hz)
-                nyquist = self.sample_rate / 2
-                low = 300 / nyquist
-                high = 3400 / nyquist
-                if 0 < low < 1 and 0 < high < 1:
-                    sos = signal.butter(4, [low, high], btype='band', output='sos')
-                    audio_16k = signal.sosfilt(sos, audio_16k)
-                
-                # 4. Noise reduction
-                noise_threshold = np.sqrt(np.mean(np.square(audio_16k))) * 0.1
-                noise_mask = np.abs(audio_16k) < noise_threshold
-                audio_16k[noise_mask] *= 0.2  # Reduce noise by 80%
-                
-            except ImportError:
-                # Basic processing without scipy
-                audio_16k = audio_16k - np.mean(audio_16k)
-            
-            # Final normalization
-            max_val = np.max(np.abs(audio_16k))
-            if max_val > 0:
-                audio_16k = audio_16k * (0.8 / max_val)
-            
-            return audio_16k.astype(np.float32)
-            
-        except Exception as e:
-            self.logger.warning(f"⚠️ Audio preprocessing failed: {e}")
-            return audio_data.astype(np.float32)
+        return text.strip()
     
-    def _is_likely_hallucination(self, text: str, audio_duration: float, audio_rms: float) -> bool:
+    def _preprocess_discord_audio(self, audio_data: np.ndarray, original_sample_rate: int) -> np.ndarray:
         """
-        Enhanced hallucination detection based on Calm-Whisper research and Discord audio patterns.
+        Preprocess Discord audio for better transcription
         
         Args:
-            text: Transcribed text to analyze
-            audio_duration: Duration of audio in seconds
-            audio_rms: RMS level of audio
+            audio_data: Raw audio data
+            original_sample_rate: Original sample rate
             
         Returns:
-            True if text is likely a hallucination
+            Preprocessed audio data
         """
-        text_lower = text.lower().strip()
-        
-        # 1. Common Whisper hallucinations (based on research and observations) - LESS AGGRESSIVE
-        common_hallucinations = [
-            "thank you",
-            "thank you.",
-            "thanks for watching",
-            "thanks for watching.",
-            "subscribe",
-            "subscribe.",
-            "like and subscribe",
-            "like and subscribe.",
-            "music",
-            "music.",
-            "[music]",
-            "(music)",
-            "♪",
-            "♫"
-        ]
-        
-        # Check for exact matches
-        if text_lower in common_hallucinations:
-            self.logger.info(f"🚫 Exact hallucination match: '{text}'")
-            return True
-        
-        # 2. Very short responses (likely noise interpretation)
-        if len(text_lower) <= 3:
-            self.logger.info(f"🚫 Text too short: '{text}'")
-            return True
-        
-        # 3. Repetitive patterns
-        words = text_lower.split()
-        if len(words) >= 2:
-            # Check for word repetition
-            word_counts = {}
-            for word in words:
-                word_counts[word] = word_counts.get(word, 0) + 1
+        try:
+            # Resample if needed
+            if original_sample_rate != self.sample_rate:
+                from scipy import signal
+                audio_data = signal.resample(audio_data, int(len(audio_data) * self.sample_rate / original_sample_rate))
             
-            # If any word appears more than 50% of the time
-            max_word_count = max(word_counts.values()) if word_counts else 0
-            repetition_ratio = max_word_count / len(words) if words else 0
+            # Convert to mono if stereo
+            if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+                audio_data = np.mean(audio_data, axis=1)
             
-            if repetition_ratio > 0.5:
-                most_repeated_word = max(word_counts.keys(), key=lambda k: word_counts[k])
-                self.logger.info(f"🚫 Repetitive pattern: '{most_repeated_word}' appears {max_word_count}/{len(words)} times")
-                return True
-        
-        # 4. Character-level repetition
-        if len(text) > 5:
-            char_counts = {}
-            for char in text_lower:
-                if char.isalpha():
-                    char_counts[char] = char_counts.get(char, 0) + 1
+            # Normalize
+            if np.max(np.abs(audio_data)) > 0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
             
-            if char_counts:
-                max_char_count = max(char_counts.values())
-                total_chars = sum(char_counts.values())
-                char_repetition_ratio = max_char_count / total_chars if total_chars > 0 else 0
-                
-                if char_repetition_ratio > 0.6:  # 60% same character
-                    self.logger.info(f"🚫 Character repetition detected: {char_repetition_ratio:.1%}")
-                    return True
-        
-        # 5. Audio-based hallucination detection
-        # Very quiet audio producing text is suspicious
-        if audio_rms < 0.01 and len(text) > 5:
-            self.logger.info(f"🚫 Quiet audio ({audio_rms:.4f}) producing long text: '{text}'")
-            return True
-        
-        # Very short audio producing long text is suspicious
-        if audio_duration < 1.0 and len(text) > 20:
-            self.logger.info(f"🚫 Short audio ({audio_duration:.2f}s) producing long text: '{text}'")
-            return True
-        
-        # 6. Specific Discord audio hallucination patterns
-        discord_patterns = [
-            "sound of the",
-            "the sound of",
-            "human speech",
-            "not a human",
-            "clear human speech",
-            "speech is not"
-        ]
-        
-        for pattern in discord_patterns:
-            if pattern in text_lower:
-                self.logger.info(f"🚫 Discord audio pattern: '{pattern}' in '{text}'")
-                return True
-        
-        # 7. Punctuation-only or mostly punctuation
-        non_alpha_chars = sum(1 for c in text if not c.isalpha() and not c.isspace())
-        alpha_chars = sum(1 for c in text if c.isalpha())
-        
-        if non_alpha_chars > alpha_chars and len(text) > 3:
-            self.logger.info(f"🚫 Mostly punctuation: '{text}'")
-            return True
-        
-        # If we get here, it's probably legitimate speech
-        return False
+            return audio_data.astype(np.float32)
+            
+        except Exception as e:
+            self.logger.warning(f"Audio preprocessing failed: {e}")
+            return audio_data
     
-    def transcribe_audio_file(self, audio_file_path: str) -> Optional[str]:
+    async def transcribe_audio_file(self, audio_file_path: str) -> Optional[str]:
         """
-        Transcribe audio from a file.
+        Transcribe audio file using external Whisper STT server
         
         Args:
             audio_file_path: Path to audio file
             
         Returns:
-            Transcribed text or None if failed
+            Transcribed text
         """
-        if not self.model:
-            self.logger.error("❌ faster-whisper STT not initialized")
-            return None
-            
         try:
-            self.logger.info(f"🎵 Transcribing file: {audio_file_path}")
-            
-            segments, info = self.model.transcribe(audio_file_path, **self.transcribe_params)
-            
-            # Collect all segments
-            transcription_parts = []
-            for segment in segments:
-                if segment.text.strip():
-                    transcription_parts.append(segment.text.strip())
-            
-            if transcription_parts:
-                result = ' '.join(transcription_parts).strip()
-                self.logger.info(f"✅ File transcription: '{result}'")
-                return result
-            else:
-                self.logger.info("🔇 No speech detected in file")
+            if not os.path.exists(audio_file_path):
+                self.logger.error(f"❌ Audio file not found: {audio_file_path}")
                 return None
-                
+            
+            # Read audio file
+            import wave
+            with wave.open(audio_file_path, 'rb') as wav_file:
+                frames = wav_file.readframes(wav_file.getnframes())
+                audio_data = np.frombuffer(frames, dtype=np.int16)
+                audio_data = audio_data.astype(np.float32) / 32768.0
+            
+            # Transcribe
+            return await self.transcribe_audio_data(audio_data)
+            
         except Exception as e:
-            self.logger.error(f"❌ Error transcribing file {audio_file_path}: {e}")
+            self.logger.error(f"❌ File transcription error: {e}")
             return None
     
-    def cleanup(self):
-        """Clean up resources."""
-        self.model = None
-        self.logger.info("🧹 faster-whisper STT service cleaned up") 
+    def is_available(self) -> bool:
+        """Check if the service is available"""
+        return self.server_available
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get service status"""
+        return {
+            "service": "Whisper STT Client",
+            "server_available": self.server_available,
+            "server_endpoint": self.server_endpoint,
+            "server_enabled": self.server_enabled,
+            "model_size": self.model_size,
+            "session_active": self.session is not None
+        }
+    
+    async def cleanup(self):
+        """Clean up resources"""
+        if self.session:
+            await self.session.close()
+            self.session = None 

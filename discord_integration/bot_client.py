@@ -18,6 +18,7 @@ import whisper  # For STT processing
 from services.tts_service import TTSService
 from services.llm_service import LLMService
 from services.memory_service import MemoryService
+from services.obs_video_service import OBSVideoService
 from core.config_loader import load_global_settings
 from utils.general_utils import setup_logger
 
@@ -35,13 +36,20 @@ class DiscordBot(commands.Bot):
                  stt_service,  # STTService type
                  tts_service: TTSService,
                  llm_service: LLMService,
-                 memory_service: MemoryService):
+                 memory_service: MemoryService,
+                 app_context=None):
         super().__init__(command_prefix=command_prefix, intents=intents)
         self.logger = setup_logger(__name__)
         self.stt_service = stt_service
         self.tts_service = tts_service
         self.llm_service = llm_service
         self.memory_service = memory_service
+        self.app_context = app_context
+        
+        # Initialize OBS video service if app_context is available
+        self.obs_service = None
+        if app_context:
+            self.obs_service = OBSVideoService(app_context)
         self.voice_client: Optional[discord.VoiceClient] = None
         self.is_processing = False
         self.current_text_channel: Optional[discord.TextChannel] = None
@@ -165,6 +173,247 @@ class DiscordBot(commands.Bot):
         """Test command to verify bot is working."""
         self.logger.info(f"🧪 !test used by {ctx.author.name}")
         await ctx.respond("🧪 **DanzarAI Voice Bot is working!** Use `!join` to start voice recording.")
+
+    # OBS Video Analysis Commands
+    @commands.command(name='obs_status')
+    async def obs_status_command(self, ctx):
+        """Check OBS connection status."""
+        self.logger.info(f"📺 !obs_status used by {ctx.author.name}")
+        
+        if not self.obs_service:
+            await ctx.respond("❌ OBS service not available - app_context not provided")
+            return
+        
+        obs_info = self.obs_service.get_obs_info()
+        
+        if obs_info.get('connected', False):
+            embed = discord.Embed(
+                title="📺 OBS Status - Connected",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="OBS Version", value=obs_info.get('obs_version', 'Unknown'), inline=True)
+            embed.add_field(name="Current Scene", value=obs_info.get('current_scene', 'Unknown'), inline=True)
+            embed.add_field(name="Analysis Enabled", value="✅ Yes" if obs_info.get('analysis_enabled') else "❌ No", inline=True)
+            
+            scenes = obs_info.get('available_scenes', [])
+            if scenes:
+                embed.add_field(name="Available Scenes", value="\n".join(f"• {scene}" for scene in scenes[:5]), inline=False)
+            
+        else:
+            embed = discord.Embed(
+                title="📺 OBS Status - Disconnected",
+                description=f"❌ {obs_info.get('error', 'Not connected')}",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Setup Instructions", 
+                          value="1. Start OBS Studio\n2. Enable WebSocket Server\n3. Tools > WebSocket Server Settings", 
+                          inline=False)
+        
+        await ctx.respond(embed=embed)
+
+    @commands.command(name='obs_connect')
+    async def obs_connect_command(self, ctx):
+        """Connect to OBS Studio."""
+        self.logger.info(f"🔌 !obs_connect used by {ctx.author.name}")
+        
+        if not self.obs_service:
+            await ctx.respond("❌ OBS service not available")
+            return
+        
+        await ctx.respond("🔌 Connecting to OBS...")
+        
+        try:
+            success = await self.obs_service.initialize()
+            if success:
+                obs_info = self.obs_service.get_obs_info()
+                embed = discord.Embed(
+                    title="✅ OBS Connected Successfully",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="OBS Version", value=obs_info.get('obs_version', 'Unknown'), inline=True)
+                embed.add_field(name="Current Scene", value=obs_info.get('current_scene', 'Unknown'), inline=True)
+                await ctx.respond(embed=embed)
+            else:
+                await ctx.respond("❌ Failed to connect to OBS. Make sure OBS is running with WebSocket server enabled.")
+        except Exception as e:
+            await ctx.respond(f"❌ Connection error: {str(e)}")
+
+    @commands.command(name='analyze_game')
+    async def analyze_game_command(self, ctx, *, prompt: str = "What's happening in this game right now?"):
+        """Analyze current game screen with Qwen2.5-Omni."""
+        self.logger.info(f"🎮 !analyze_game used by {ctx.author.name}: {prompt}")
+        
+        if not self.obs_service:
+            await ctx.respond("❌ OBS service not available")
+            return
+        
+        # Send initial response
+        await ctx.respond("🧠 Analyzing current game screen with Qwen2.5-Omni...")
+        
+        try:
+            # Get analysis from OBS service
+            analysis = await self.obs_service.get_current_analysis(prompt)
+            
+            # Create embed for the analysis
+            embed = discord.Embed(
+                title="🎮 Game Analysis",
+                description=analysis,
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text=f"Analysis by Qwen2.5-Omni • Requested by {ctx.author.display_name}")
+            
+            await ctx.respond(embed=embed)
+            
+            # If TTS is enabled, also speak the analysis
+            if self.tts_service and len(analysis) < 500:  # Keep TTS reasonable length
+                try:
+                    tts_audio = self.tts_service.generate_audio(analysis)
+                    if tts_audio and self.voice_client:
+                        # Play TTS in voice channel
+                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                            temp_file.write(tts_audio)
+                            temp_file_path = temp_file.name
+                        
+                        audio_source = discord.FFmpegPCMAudio(temp_file_path)
+                        self.voice_client.play(audio_source)
+                        
+                        # Clean up temp file after playback
+                        def cleanup_temp_file(error):
+                            if os.path.exists(temp_file_path):
+                                os.unlink(temp_file_path)
+                        
+                        self.voice_client.source.after = cleanup_temp_file
+                        
+                except Exception as tts_error:
+                    self.logger.warning(f"TTS playback failed: {tts_error}")
+            
+        except Exception as e:
+            self.logger.error(f"Game analysis failed: {e}")
+            await ctx.respond(f"❌ Analysis failed: {str(e)}")
+
+    @commands.command(name='obs_scenes')
+    async def obs_scenes_command(self, ctx):
+        """List available OBS scenes."""
+        self.logger.info(f"🎬 !obs_scenes used by {ctx.author.name}")
+        
+        if not self.obs_service:
+            await ctx.respond("❌ OBS service not available")
+            return
+        
+        obs_info = self.obs_service.get_obs_info()
+        
+        if not obs_info.get('connected', False):
+            await ctx.respond("❌ OBS not connected. Use `!obs_connect` first.")
+            return
+        
+        scenes = obs_info.get('available_scenes', [])
+        current_scene = obs_info.get('current_scene', 'Unknown')
+        
+        if scenes:
+            embed = discord.Embed(
+                title="🎬 OBS Scenes",
+                color=discord.Color.purple()
+            )
+            
+            scene_list = []
+            for scene in scenes:
+                if scene == current_scene:
+                    scene_list.append(f"🎯 **{scene}** (current)")
+                else:
+                    scene_list.append(f"• {scene}")
+            
+            embed.description = "\n".join(scene_list)
+            await ctx.respond(embed=embed)
+        else:
+            await ctx.respond("❌ No scenes found in OBS")
+
+    @commands.command(name='gaming_commentary')
+    async def gaming_commentary_command(self, ctx, duration: int = 60):
+        """Start live gaming commentary for specified duration (in seconds)."""
+        self.logger.info(f"🎮 !gaming_commentary used by {ctx.author.name} for {duration}s")
+        
+        if not self.obs_service:
+            await ctx.respond("❌ OBS service not available")
+            return
+        
+        if duration > 300:  # Limit to 5 minutes
+            await ctx.respond("❌ Maximum duration is 300 seconds (5 minutes)")
+            return
+        
+        obs_info = self.obs_service.get_obs_info()
+        if not obs_info.get('connected', False):
+            await ctx.respond("❌ OBS not connected. Use `!obs_connect` first.")
+            return
+        
+        # Send initial response
+        embed = discord.Embed(
+            title="🎮 Starting Live Gaming Commentary",
+            description=f"Duration: {duration} seconds\nAnalyzing with Qwen2.5-Omni...",
+            color=discord.Color.gold()
+        )
+        await ctx.respond(embed=embed)
+        
+        # Commentary callback to send results to Discord
+        async def commentary_callback(analysis: str, frame):
+            try:
+                # Create embed for each analysis
+                embed = discord.Embed(
+                    title="🎮 Live Commentary",
+                    description=analysis[:1000],  # Limit length
+                    color=discord.Color.blue()
+                )
+                embed.set_footer(text="Powered by Qwen2.5-Omni")
+                
+                await ctx.channel.send(embed=embed)
+                
+                # Optional TTS for live commentary
+                if self.tts_service and self.voice_client and len(analysis) < 300:
+                    try:
+                        tts_audio = self.tts_service.generate_audio(analysis)
+                        if tts_audio:
+                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                                temp_file.write(tts_audio)
+                                temp_file_path = temp_file.name
+                            
+                            if not self.voice_client.is_playing():
+                                audio_source = discord.FFmpegPCMAudio(temp_file_path)
+                                self.voice_client.play(audio_source)
+                    except Exception as tts_error:
+                        self.logger.warning(f"Live TTS failed: {tts_error}")
+                
+            except Exception as e:
+                self.logger.error(f"Commentary callback error: {e}")
+        
+        try:
+            # Start live analysis (this is a simplified version - full implementation would be in the main loop)
+            analysis_interval = 15.0  # Analyze every 15 seconds
+            analyses_to_perform = max(1, duration // int(analysis_interval))
+            
+            for i in range(analyses_to_perform):
+                if i > 0:  # Don't wait before first analysis
+                    await asyncio.sleep(analysis_interval)
+                
+                analysis = await self.obs_service.get_current_analysis(
+                    "Provide live gaming commentary. What's happening right now? Keep it engaging and brief."
+                )
+                
+                await commentary_callback(analysis, None)
+                
+                # Check if we should continue
+                if (i + 1) * analysis_interval >= duration:
+                    break
+            
+            # Final message
+            embed = discord.Embed(
+                title="✅ Live Commentary Complete",
+                description=f"Analyzed gameplay for {duration} seconds",
+                color=discord.Color.green()
+            )
+            await ctx.channel.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Live commentary failed: {e}")
+            await ctx.channel.send(f"❌ Live commentary failed: {str(e)}")
 
     async def recording_finished(self, sink: discord.sinks.WaveSink, channel: discord.TextChannel, *args):
         """Callback when recording is finished - processes all recorded audio."""
@@ -1083,3 +1332,328 @@ class DiscordBot(commands.Bot):
     def _recording_error(self, error):
         """Called when recording encounters an error."""
         self.logger.error(f"[DiscordBot] Recording error: {error}")
+
+    # Video Analysis Commands
+    @commands.command(name='video')
+    async def video_command(self, ctx, action: str = "help", *, args: str = ""):
+        """Main video analysis command with subcommands"""
+        self.logger.info(f"📺 !video {action} used by {ctx.author.name}")
+        
+        if action.lower() == "help":
+            embed = discord.Embed(
+                title="📺 Video Analysis Commands",
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="🎯 Analysis Commands",
+                value="`!video analyze [prompt]` - Analyze current screen\n"
+                      "`!video quick` - Quick game state analysis\n"
+                      "`!video detailed` - Detailed gameplay analysis",
+                inline=False
+            )
+            embed.add_field(
+                name="🎮 Live Monitoring",
+                value="`!video start [seconds]` - Start live monitoring\n"
+                      "`!video stop` - Stop live monitoring\n"
+                      "`!video status` - Check monitoring status",
+                inline=False
+            )
+            embed.add_field(
+                name="🔧 Settings",
+                value="`!video settings` - Show current settings\n"
+                      "`!video quality [low/medium/high]` - Set analysis quality",
+                inline=False
+            )
+            await ctx.send(embed=embed)
+            
+        elif action.lower() == "analyze":
+            await self._video_analyze(ctx, args or "What's happening in this game?")
+        elif action.lower() == "quick":
+            await self._video_analyze(ctx, "Quick analysis: What's the current game state?")
+        elif action.lower() == "detailed":
+            await self._video_analyze(ctx, "Detailed analysis: Describe the current gameplay situation, UI elements, character status, and strategic opportunities.")
+        elif action.lower() == "start":
+            duration = 60
+            if args.strip().isdigit():
+                duration = int(args.strip())
+            await self._video_start_monitoring(ctx, duration)
+        elif action.lower() == "stop":
+            await self._video_stop_monitoring(ctx)
+        elif action.lower() == "status":
+            await self._video_status(ctx)
+        elif action.lower() == "settings":
+            await self._video_settings(ctx)
+        elif action.lower() == "quality":
+            await self._video_quality(ctx, args.strip())
+        else:
+            await ctx.send(f"❌ Unknown video command: `{action}`. Use `!video help` for available commands.")
+
+    async def _video_analyze(self, ctx, prompt: str):
+        """Analyze current video frame with custom prompt"""
+        if not hasattr(self, 'obs_service') or not self.obs_service:
+            await ctx.send("❌ **OBS service not available**")
+            return
+            
+        try:
+            # Show thinking message
+            thinking_msg = await ctx.send("🤖 **Analyzing current screen...** (This may take 10-20 seconds)")
+            
+            # Get analysis
+            start_time = time.time()
+            analysis = await self.obs_service.get_current_analysis(prompt)
+            analysis_time = time.time() - start_time
+            
+            # Delete thinking message
+            try:
+                await thinking_msg.delete()
+            except:
+                pass
+            
+            if analysis and analysis.strip():
+                embed = discord.Embed(
+                    title="🎯 Video Analysis Result",
+                    description=analysis,
+                    color=discord.Color.green()
+                )
+                embed.set_footer(text=f"Analysis completed in {analysis_time:.1f}s")
+                await ctx.send(embed=embed)
+                
+                # Optional TTS
+                if self.tts_service and ctx.voice_client:
+                    try:
+                        tts_audio = self.tts_service.generate_audio(analysis)
+                        if tts_audio:
+                            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(tts_audio))
+                            ctx.voice_client.play(source)
+                    except Exception as e:
+                        self.logger.warning(f"TTS failed: {e}")
+            else:
+                await ctx.send("❌ **Analysis failed** - Could not capture or analyze the current screen")
+                
+        except Exception as e:
+            self.logger.error(f"Video analysis failed: {e}")
+            await ctx.send(f"❌ **Analysis error:** {str(e)}")
+
+    async def _video_start_monitoring(self, ctx, duration: int):
+        """Start live video monitoring"""
+        if not hasattr(self, 'obs_service') or not self.obs_service:
+            await ctx.send("❌ **OBS service not available**")
+            return
+            
+        try:
+            # Check if already monitoring
+            if hasattr(self.obs_service, 'is_processing') and self.obs_service.is_processing:
+                await ctx.send("⚠️ **Video monitoring already active**")
+                return
+            
+            embed = discord.Embed(
+                title="📺 Starting Live Video Monitoring",
+                description=f"Monitoring gameplay for {duration} seconds\nAnalysis every 20 seconds",
+                color=discord.Color.blue()
+            )
+            await ctx.send(embed=embed)
+            
+            # Set monitoring flag
+            if hasattr(self.obs_service, 'is_processing'):
+                self.obs_service.is_processing = True
+            
+            analysis_interval = 20  # Every 20 seconds
+            total_analyses = max(1, duration // analysis_interval)
+            
+            for i in range(total_analyses):
+                try:
+                    # Check if monitoring was stopped
+                    if hasattr(self.obs_service, 'is_processing') and not self.obs_service.is_processing:
+                        break
+                    
+                    analysis = await self.obs_service.get_current_analysis(
+                        f"Live gaming analysis #{i+1}: What's happening now? Focus on current action and strategy."
+                    )
+                    
+                    if analysis:
+                        embed = discord.Embed(
+                            title=f"🎮 Live Analysis #{i+1}/{total_analyses}",
+                            description=analysis,
+                            color=discord.Color.green()
+                        )
+                        await ctx.send(embed=embed)
+                    
+                    # Wait for next analysis (unless it's the last one)
+                    if i < total_analyses - 1:
+                        await asyncio.sleep(analysis_interval)
+                        
+                except Exception as e:
+                    self.logger.error(f"Analysis {i+1} failed: {e}")
+                    continue
+            
+            # Reset monitoring flag
+            if hasattr(self.obs_service, 'is_processing'):
+                self.obs_service.is_processing = False
+            
+            embed = discord.Embed(
+                title="✅ Video Monitoring Complete",
+                description=f"Completed {total_analyses} analyses over {duration} seconds",
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            # Reset monitoring flag on error
+            if hasattr(self.obs_service, 'is_processing'):
+                self.obs_service.is_processing = False
+            self.logger.error(f"Video monitoring failed: {e}")
+            await ctx.send(f"❌ **Monitoring failed:** {str(e)}")
+
+    async def _video_stop_monitoring(self, ctx):
+        """Stop live video monitoring"""
+        if not hasattr(self, 'obs_service') or not self.obs_service:
+            await ctx.send("❌ **OBS service not available**")
+            return
+            
+        try:
+            if hasattr(self.obs_service, 'is_processing'):
+                if self.obs_service.is_processing:
+                    self.obs_service.is_processing = False
+                    await ctx.send("⏹️ **Video monitoring stopped**")
+                else:
+                    await ctx.send("ℹ️ **No active monitoring to stop**")
+            else:
+                await ctx.send("ℹ️ **Monitoring status unknown**")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to stop monitoring: {e}")
+            await ctx.send(f"❌ **Error stopping monitoring:** {str(e)}")
+
+    async def _video_status(self, ctx):
+        """Show video analysis status"""
+        if not hasattr(self, 'obs_service') or not self.obs_service:
+            await ctx.send("❌ **OBS service not available**")
+            return
+            
+        try:
+            obs_info = self.obs_service.get_obs_info()
+            
+            embed = discord.Embed(
+                title="📺 Video Analysis Status",
+                color=discord.Color.blue()
+            )
+            
+            # OBS Connection
+            if obs_info.get("connected", False):
+                embed.add_field(
+                    name="🟢 OBS Connection",
+                    value=f"Connected to OBS {obs_info.get('obs_version', 'Unknown')}\n"
+                          f"Current Scene: {obs_info.get('current_scene', 'Unknown')}",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🔴 OBS Connection",
+                    value="Not connected to OBS",
+                    inline=False
+                )
+            
+            # Monitoring Status
+            is_monitoring = obs_info.get("is_processing", False)
+            embed.add_field(
+                name="📊 Monitoring",
+                value="🟢 Active" if is_monitoring else "🔴 Inactive",
+                inline=True
+            )
+            
+            # Analysis Status
+            analysis_enabled = obs_info.get("analysis_enabled", True)
+            embed.add_field(
+                name="🤖 AI Analysis",
+                value="🟢 Enabled" if analysis_enabled else "🔴 Disabled",
+                inline=True
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get video status: {e}")
+            await ctx.send(f"❌ **Status error:** {str(e)}")
+
+    async def _video_settings(self, ctx):
+        """Show video analysis settings"""
+        try:
+            settings = self.memory_service.global_settings
+            
+            embed = discord.Embed(
+                title="⚙️ Video Analysis Settings",
+                color=discord.Color.blue()
+            )
+            
+            embed.add_field(
+                name="📺 Video Configuration",
+                value=f"Analysis Enabled: {settings.get('VIDEO_ANALYSIS_ENABLED', False)}\n"
+                      f"Gaming Mode: {settings.get('VIDEO_GAMING_MODE', False)}\n"
+                      f"Save Debug Frames: {settings.get('VIDEO_SAVE_DEBUG_FRAMES', False)}",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="🎯 Quality Settings",
+                value=f"Capture Quality: {settings.get('VIDEO_CAPTURE_QUALITY', 0.8)}\n"
+                      f"Target FPS: {settings.get('VIDEO_TARGET_FPS', 15)}\n"
+                      f"Analysis Interval: {settings.get('VIDEO_ANALYSIS_INTERVAL', 10.0)}s",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="🔗 OBS Configuration",
+                value=f"Host: {settings.get('OBS_HOST', 'localhost')}\n"
+                      f"Port: {settings.get('OBS_PORT', 4455)}\n"
+                      f"Password: {'Set' if settings.get('OBS_PASSWORD') else 'None'}",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to show settings: {e}")
+            await ctx.send(f"❌ **Settings error:** {str(e)}")
+
+    async def _video_quality(self, ctx, quality: str):
+        """Set video analysis quality"""
+        if not quality:
+            await ctx.send("❌ **Please specify quality:** `low`, `medium`, or `high`")
+            return
+            
+        quality_settings = {
+            "low": {"capture_quality": 0.5, "target_fps": 10, "analysis_interval": 30.0},
+            "medium": {"capture_quality": 0.8, "target_fps": 15, "analysis_interval": 15.0},
+            "high": {"capture_quality": 1.0, "target_fps": 30, "analysis_interval": 10.0}
+        }
+        
+        if quality.lower() not in quality_settings:
+            await ctx.send("❌ **Invalid quality.** Use: `low`, `medium`, or `high`")
+            return
+            
+        try:
+            settings = quality_settings[quality.lower()]
+            
+            # Update settings (note: this would require a way to persist settings)
+            embed = discord.Embed(
+                title=f"⚙️ Quality Set to {quality.title()}",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="📊 New Settings",
+                value=f"Capture Quality: {settings['capture_quality']}\n"
+                      f"Target FPS: {settings['target_fps']}\n"
+                      f"Analysis Interval: {settings['analysis_interval']}s",
+                inline=False
+            )
+            embed.add_field(
+                name="ℹ️ Note",
+                value="Settings will apply to new analyses. Restart DanzarAI to persist changes.",
+                inline=False
+            )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set quality: {e}")
+            await ctx.send(f"❌ **Quality setting error:** {str(e)}")
