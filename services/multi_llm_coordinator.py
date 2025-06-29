@@ -442,8 +442,9 @@ class MultiLLMCoordinator:
         
         context_text = "\n".join(context_parts) if context_parts else ""
         
+        system_prompt = self.ctx.active_profile.system_prompt_commentary if self.ctx and hasattr(self.ctx, 'active_profile') else "You are DANZAR, a vision-capable gaming assistant with a witty personality."
         generation_prompt = f"""
-        You are DanzarAI, a helpful gaming assistant specializing in EverQuest.
+        {system_prompt}
         
         User: {user_name}
         Query: "{query}"

@@ -1,0 +1,49 @@
+# DanzarAI Vision Pipeline Requirements
+# ====================================
+
+# Core dependencies
+torch>=2.0.0                    # PyTorch for GPU acceleration
+torchvision>=0.15.0             # Computer vision utilities
+clip @ git+https://github.com/openai/CLIP.git
+Pillow>=9.0.0                  # Image processing
+numpy>=1.21.0                   # Numerical computing
+opencv-python>=4.5.0            # Computer vision library
+transformers>=4.20.0             # Transformers for NLP
+
+# Screen capture
+mss>=9.0.0                      # Fast screen capture
+
+# OCR
+pytesseract>=0.3.10             # Tesseract OCR wrapper
+pytesseract-binary>=0.1.0       # Tesseract binaries
+
+# Configuration and utilities
+PyYAML>=6.0                     # YAML configuration
+dataclasses-json>=0.6.0         # JSON serialization for dataclasses
+
+# Optional: GPU monitoring
+GPUtil>=1.4.0                   # GPU monitoring utilities
+
+# Optional: Performance profiling
+psutil>=5.9.0                   # System monitoring
+
+# Development dependencies (optional)
+pytest>=7.0.0                   # Testing framework
+pytest-asyncio>=0.21.0          # Async testing support
+black>=23.0.0                   # Code formatting
+flake8>=6.0.0                   # Linting
+
+# Additional dependencies
+ultralytics>=8.0.0              # YOLOv8 implementation
+easyocr>=1.6.0                  # EasyOCR for OCR
+
+# Vision and CLIP requirements
+torch>=2.0.0
+torchvision>=0.15.0
+clip @ git+https://github.com/openai/CLIP.git
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+transformers>=4.20.0
+easyocr>=1.6.0
+ultralytics>=8.0.0 

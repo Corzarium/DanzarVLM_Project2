@@ -654,16 +654,8 @@ class AgenticRAGService:
         """
         Generate natural language response using available LLM services
         """
-        # Enhanced system prompt for gaming context
-        system_prompt = """You are DanzarVLM, an expert gaming assistant specializing in EverQuest. 
-        
-        Your responses should be:
-        - Clear and concise (under 200 words)
-        - Direct answers to the user's question
-        - Based only on the provided context
-        - Natural and conversational
-        
-        If the context doesn't fully answer the question, say so briefly."""
+        # Use profile-based system prompt instead of hardcoded one
+        system_prompt = self.ctx.active_profile.system_prompt_commentary
         
         # Construct optimized prompt
         user_prompt = f"""Context: {context}

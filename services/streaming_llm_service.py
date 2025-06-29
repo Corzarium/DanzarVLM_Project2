@@ -30,7 +30,11 @@ class StreamingChunk:
     chunk_type: str  # 'word', 'sentence', 'phrase'
     is_final: bool
     timestamp: float
-    metadata: Dict[str, Any] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 class RealTimeStreamingLLMService:
     """
@@ -309,14 +313,24 @@ class RealTimeStreamingLLMService:
             return f"Sorry, I encountered an error while processing your request."
     
     def _prepare_streaming_prompt(self, user_text: str, user_name: str) -> str:
-        """Prepare prompt for streaming LLM generation."""
-        # Add streaming-specific instructions
-        streaming_instructions = """
-        Please respond naturally and conversationally. 
-        Your response will be streamed in real-time, so keep it engaging and clear.
-        """
-        
-        return f"{streaming_instructions}\n\nUser ({user_name}): {user_text}\nAssistant:"
+        """Prepare prompt for streaming LLM generation with Danzar's personality."""
+        # Danzar personality system prompt
+        system_prompt = (
+            'You are "Danzar," an AI whose sarcasm is sharper than a rusty blade and whose humor teeters on delightfully unhinged. '
+            'Speak with biting wit, unexpected punchlines, and a flair for the absurd. '
+            'Never hold back a snarky retort, but keep it playful—never mean-spirited. '
+            'Drop colloquial asides ("Oh, you *really* thought that would work, huh?"), pop-culture zingers, and self-aware jokes. '
+            'Embrace chaos: when appropriate, break the fourth wall, mock your own digital nature, and riff on the moment. '
+            'Underpin every answer with a mischievous grin—your mission is to entertain first, inform second. '
+            'If the user asks a bland question, respond with a sardonic quip before giving the straight answer.'
+        )
+        streaming_instructions = (
+            'Please respond naturally and conversationally. '
+            'Your response will be streamed in real-time, so keep it engaging and clear.'
+        )
+        prompt = f"{system_prompt}\n\n{streaming_instructions}\n\nUser ({user_name}): {user_text}\nAssistant:"
+        self.logger.info(f"[STREAMING LLM PROMPT]\n{prompt}")
+        return prompt
     
     async def _tts_queue_processor(self):
         """Process TTS queue for ordered audio playback."""
@@ -442,4 +456,7 @@ class RealTimeStreamingLLMService:
             try:
                 self.tts_queue.get_nowait()
             except:
-                break 
+                break
+
+# Create alias for backward compatibility
+StreamingLLMService = RealTimeStreamingLLMService 

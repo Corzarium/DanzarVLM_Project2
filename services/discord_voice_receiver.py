@@ -34,6 +34,10 @@ class DiscordVoiceReceiver:
         self.user_buffers: Dict[int, deque] = {}
         self.user_speech_state: Dict[int, dict] = {}
         
+        # Enhanced user tracking with username mapping
+        self.user_names: Dict[int, str] = {}  # Map user_id to display_name
+        self.user_cache: Dict[int, Any] = {}  # Cache Discord user objects
+        
         # Buffer settings for speech accumulation
         self.min_speech_duration = 1.0   # Minimum 1 second of speech
         self.max_speech_duration = 10.0  # Maximum 10 seconds before processing
@@ -55,6 +59,38 @@ class DiscordVoiceReceiver:
             self.logger.error(f"❌ Failed to initialize Discord voice receiver: {e}")
             return False
     
+    def update_user_info(self, user_id: int, user_object: Any) -> str:
+        """Update user information and return display name."""
+        try:
+            if user_object and hasattr(user_object, 'id'):
+                # Store user object for future reference
+                self.user_cache[user_id] = user_object
+                
+                # Get display name (prefer display_name over name)
+                if hasattr(user_object, 'display_name') and user_object.display_name:
+                    display_name = user_object.display_name
+                elif hasattr(user_object, 'name') and user_object.name:
+                    display_name = user_object.name
+                else:
+                    display_name = f"User{user_id}"
+                
+                # Update user mapping
+                self.user_names[user_id] = display_name
+                self.logger.debug(f"[DiscordVoiceReceiver] Updated user {user_id} -> {display_name}")
+                return display_name
+            else:
+                # Fallback for when user object is not available
+                display_name = self.user_names.get(user_id, f"User{user_id}")
+                return display_name
+                
+        except Exception as e:
+            self.logger.error(f"[DiscordVoiceReceiver] Error updating user info for {user_id}: {e}")
+            return self.user_names.get(user_id, f"User{user_id}")
+    
+    def get_user_display_name(self, user_id: int) -> str:
+        """Get display name for a user ID."""
+        return self.user_names.get(user_id, f"User{user_id}")
+    
     async def handle_silence_timeout(self):
         """Background task to handle silence timeouts."""
         while True:
@@ -67,8 +103,8 @@ class DiscordVoiceReceiver:
                         current_time - user_state['last_packet_time'] > self.silence_timeout and
                         user_state['total_duration'] >= self.min_speech_duration):
                         
-                        # Find display name (simplified)
-                        display_name = f"User{user_id}"
+                        # Use actual username instead of generic name
+                        display_name = self.get_user_display_name(user_id)
                         await self._process_user_speech(user_id, display_name, "silence timeout")
                 
                 await asyncio.sleep(0.5)  # Check every 500ms
@@ -110,6 +146,8 @@ class DiscordVoiceReceiver:
         """Clean up resources."""
         self.user_buffers.clear()
         self.user_speech_state.clear()
+        self.user_names.clear()
+        self.user_cache.clear()
         
         self.logger.info("🧹 Discord voice receiver cleaned up")
 
@@ -127,12 +165,13 @@ class NativeDiscordSink:
             # Handle case where user is passed as ID instead of object
             if isinstance(user, int):
                 user_id = user
-                display_name = f"User{user_id}"
+                display_name = self.voice_receiver.get_user_display_name(user_id)
             else:
                 if user.bot:
                     return  # Ignore bot audio
                 user_id = user.id
-                display_name = getattr(user, 'display_name', user.name)
+                # Update user info and get display name
+                display_name = self.voice_receiver.update_user_info(user_id, user)
             
             # Initialize user state if needed
             if user_id not in self.voice_receiver.user_buffers:

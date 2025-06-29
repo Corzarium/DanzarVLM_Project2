@@ -1,0 +1,29 @@
+# DanzarAI Memory Configuration
+# Hybrid STM (Short-Term Memory) + LTM (Long-Term Memory) System
+
+# Qdrant Database Settings
+qdrant_url: "http://localhost:6333"
+stm_collection: "danzar_stm"
+ltm_collection: "danzar_ltm"
+
+# Short-Term Memory Settings
+stm_max_turns: 100          # Maximum turns in RAM buffer
+stm_decay_minutes: 30       # Minutes before STM entries start decaying
+stm_decay_threshold: 0.05   # Weight threshold for STM cleanup
+stm_retrieve_k: 10          # Number of STM entries to retrieve per query
+
+# Long-Term Memory Settings
+ltm_retrieve_k: 5           # Number of LTM entries to retrieve per query
+ltm_summary_threshold: 20   # Create LTM summary after N conversation turns
+
+# Embedding Model Settings
+embedding_model: "all-MiniLM-L6-v2"  # Sentence transformer model for embeddings
+# Alternative models: "all-mpnet-base-v2", "multi-qa-MiniLM-L6-cos-v1"
+
+# System Settings
+auto_cleanup_interval: 300  # Seconds between automatic cleanup runs (5 minutes)
+
+# Memory Integration Settings
+enable_vision_context: true     # Include vision data in memory context
+enable_game_awareness: true     # Track game-specific memories
+enable_user_tracking: true      # Track user-specific conversation history 

@@ -133,34 +133,7 @@ class ToolAwareLLMService:
             }
         
         # Use LLM to determine tool usage
-        system_prompt = """You are a tool planning assistant. Analyze the user's query and determine if any tools are needed.
-
-Available tools:
-1. search_knowledge - Search the knowledge base for game information (EverQuest, classes, quests, items, etc.)
-2. web_search - Search the web for current information not in the knowledge base
-3. get_conversation_context - Get recent conversation history
-
-Respond with ONLY a JSON object in this exact format:
-{
-    "needs_tools": true/false,
-    "reasoning": "brief explanation",
-    "tool_calls": [
-        {
-            "tool": "tool_name",
-            "parameters": {"param": "value"}
-        }
-    ]
-}
-
-CRITICAL TOOL USAGE GUIDELINES:
-- For EverQuest game-related questions: ALWAYS start with search_knowledge using collection "Everquest"
-- For current events, weather, news, prices, or recent information: Use web_search directly
-- For questions about technology, programming, or general knowledge: Use web_search
-- If you're unsure whether information is in the knowledge base: Use BOTH tools - search_knowledge first, then web_search
-- For simple greetings or casual conversation: set needs_tools to false
-- When in doubt about information availability: PREFER using tools rather than guessing
-
-IMPORTANT: The knowledge base primarily contains EverQuest game information. For anything else, strongly consider web_search."""
+        system_prompt = self.app_context.active_profile.system_prompt_commentary
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -718,17 +691,7 @@ IMPORTANT: The knowledge base primarily contains EverQuest game information. For
 
     async def _generate_direct_response(self, user_text: str, user_name: str) -> str:
         """Generate a direct response without using any tools"""
-        system_prompt = """You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). 
-
-Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. 
-When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. 
-Use gamer lingo naturally, but explain anything arcane so newcomers feel included. 
-Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.
-
-For simple greetings, be warm and welcoming with that signature raid leader energy! 
-If the user asks about specific game information that you don't know, let them know you can search for that information.
-
-IMPORTANT: Provide only your final response to the user. Do not include your reasoning process or thinking steps in your response."""
+        system_prompt = self.app_context.active_profile.system_prompt_commentary
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -794,24 +757,7 @@ IMPORTANT: Provide only your final response to the user. Do not include your rea
             else:
                 tool_context += f"\n\n=== {result.tool_name.upper()} FAILED ===\n{result.content}"
         
-        system_prompt = f"""You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals! The user asked a question and you used tools to gather information. 
-
-Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. 
-Use gamer lingo naturally, but explain anything arcane so newcomers feel included. 
-Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.
-
-Use the tool results below to provide a comprehensive, helpful answer to the user's question.
-
-TOOL RESULTS:{tool_context}
-
-Guidelines:
-- Use the information from successful tool results to answer the user's question with enthusiasm
-- If tools failed, stay positive and provide what help you can
-- Be conversational and encouraging with that raid leader energy
-- Don't mention the technical details of tool execution
-- Focus on answering the user's original question with helpful, forward-thinking advice
-
-IMPORTANT: Provide only your final response to the user. Do not include your reasoning process, thinking steps, or analysis in your response. Give a direct, helpful answer with your signature upbeat energy!"""
+        system_prompt = self.app_context.active_profile.system_prompt_commentary
         
         messages = [
             {"role": "system", "content": system_prompt},

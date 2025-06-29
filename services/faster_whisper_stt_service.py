@@ -25,7 +25,7 @@ class WhisperSTTService:
         self.logger = app_context.logger
         
         # Server configuration
-        self.server_endpoint = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('endpoint', 'http://localhost:8084/transcribe')
+        self.endpoint = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('endpoint', 'http://localhost:8083/transcribe')
         self.server_timeout = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('timeout', 30)
         self.server_enabled = self.app_context.global_settings.get('EXTERNAL_SERVERS', {}).get('WHISPER_STT_SERVER', {}).get('enabled', True)
         
@@ -40,7 +40,7 @@ class WhisperSTTService:
         self.server_available = False
         
         self.logger.info(f"[WhisperSTTService] Initializing client for model: {model_size}")
-        self.logger.info(f"[WhisperSTTService] Server endpoint: {self.server_endpoint}")
+        self.logger.info(f"[WhisperSTTService] Server endpoint: {self.endpoint}")
         
     async def initialize(self) -> bool:
         """Initialize the Whisper STT service client"""
@@ -77,7 +77,7 @@ class WhisperSTTService:
                 return
                 
             # Try to get server health status
-            async with self.session.get(f"{self.server_endpoint.replace('/transcribe', '/health')}") as response:
+            async with self.session.get(f"{self.endpoint.replace('/transcribe', '/health')}") as response:
                 if response.status == 200:
                     self.server_available = True
                     self.logger.info("✅ Whisper STT server is available")
@@ -120,7 +120,7 @@ class WhisperSTTService:
             
             # Make the request
             async with self.session.post(
-                self.server_endpoint,
+                self.endpoint,
                 data=form_data
             ) as response:
                 
@@ -306,7 +306,7 @@ class WhisperSTTService:
         return {
             "service": "Whisper STT Client",
             "server_available": self.server_available,
-            "server_endpoint": self.server_endpoint,
+            "server_endpoint": self.endpoint,
             "server_enabled": self.server_enabled,
             "model_size": self.model_size,
             "session_active": self.session is not None

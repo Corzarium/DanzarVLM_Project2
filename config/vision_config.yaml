@@ -1,0 +1,287 @@
+# DanzarAI Vision Pipeline Configuration
+# =====================================
+
+# Frame Capture Settings
+capture:
+  # Use NDI instead of MSS to avoid Windows threading issues
+  use_ndi: true
+  ndi_source_name: "CENTERAILUM-AI (OBS)"  # Updated to match actual NDI source name
+  region: "ndi"  # "fullscreen", "window", "region", or "ndi"
+  
+  # Fallback to MSS if NDI fails
+  fallback_to_mss: true
+  mss_region: "fullscreen"  # "fullscreen", "primary", or specific window
+  
+  # Performance settings - DRASTICALLY REDUCED for stability
+  fps: 1  # Reduced to 1 FPS for maximum stability
+  max_resolution: [1920, 1080]  # Reduced from 4K to 1080p for better performance
+  enable_debug_frames: false
+  debug_output_path: "./debug_frames"
+
+# NDI Capture Rate Control
+ndi_capture:
+  vision_capture_fps: 1  # Capture at 1 FPS from NDI source
+  enable_rate_limiting: true
+  max_queue_size: 10  # Small queue since we're capturing slowly
+
+# CLIP Video Understanding Settings
+clip:
+  enabled: true                      # Enable CLIP video understanding
+  processing_fps: 0.5                # Process CLIP every 2 seconds (reduced frequency)
+  model_name: "ViT-B/32"             # CLIP model to use
+  device: "cuda:1"                   # Device to run CLIP on (4070 Super - main LLM on cuda:0)
+  confidence_threshold: 0.3          # Minimum confidence for CLIP insights
+  max_insights: 5                    # Reduced from 10 to 5 for better performance
+  enable_logging: true               # Enable CLIP logging to see what it detects
+  log_insights: true                 # Log all CLIP insights
+  game_concepts:                     # Game-specific visual concepts for CLIP
+    everquest:
+      - "health bar"
+      - "mana bar"
+      - "inventory window"
+      - "spell book"
+      - "chat window"
+      - "character portrait"
+      - "experience bar"
+      - "compass"
+      - "map"
+      - "group window"
+      - "combat log"
+      - "target window"
+      - "hotbar"
+      - "spell effects"
+      - "monster"
+      - "player character"
+      - "npc"
+      - "quest window"
+      - "trade window"
+      - "guild window"
+    generic_game:
+      - "health bar"
+      - "inventory"
+      - "menu"
+      - "button"
+      - "text"
+      - "character"
+      - "enemy"
+      - "weapon"
+      - "armor"
+      - "potion"
+      - "gold"
+      - "experience"
+      - "level"
+      - "skill tree"
+      - "map"
+      - "minimap"
+      - "chat"
+      - "notification"
+      - "loading screen"
+    rimworld:
+      - "colonist"
+      - "room"
+      - "bed"
+      - "table"
+      - "chair"
+      - "door"
+      - "wall"
+      - "floor"
+      - "crop"
+      - "animal"
+      - "tool"
+      - "weapon"
+      - "medicine"
+      - "food"
+      - "storage"
+      - "workbench"
+      - "power generator"
+      - "battery"
+      - "wire"
+      - "research bench"
+
+# YOLO Object Detection Settings
+yolo:
+  model_path: "models/yolo-nano.pt"  # Path to YOLO model
+  confidence_threshold: 0.6          # Increased threshold to reduce false positives
+  device: "cuda:1"                   # Device to run on (4070 Super - main LLM on cuda:0)
+  classes:                           # Class names for detection
+    - "health_bar"
+    - "minimap"
+    - "boss"
+    - "player"
+    - "enemy"
+    - "loot"
+    - "chat"
+    - "inventory"
+    - "spell_icon"
+    - "cooldown"
+
+# Template Matching Settings
+template_matching:
+  enabled: false                     # Disabled to reduce processing load
+  templates_dir: "assets/templates/" # Directory containing template images
+  threshold: 0.8                     # Matching threshold (0.0-1.0)
+  max_matches: 5                     # Maximum matches per template
+
+# OCR Settings
+ocr:
+  enabled: false                     # DISABLED - OCR is causing confusion with garbage text
+  roi: [50, 50, 800, 600]           # Larger region of interest [x1, y1, x2, y2] for better text detection
+  tesseract_config: "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?;:()[]{}'\"-+=/\\|@#$%^&*<> "  # Improved config with character whitelist
+  min_confidence: 0.7                # Increased confidence threshold to reduce garbage text
+  max_text_length: 200               # Maximum text length to prevent very long garbage
+  min_text_length: 2                 # Minimum text length to filter out single characters
+  filter_garbage: true               # Enable garbage text filtering
+  garbage_patterns:                  # Patterns to filter out as garbage
+    - "^[^a-zA-Z0-9]*$"             # No alphanumeric characters
+    - "^[0-9]{1,2}$"                # Just 1-2 digits
+    - "^[a-zA-Z]{1,2}$"             # Just 1-2 letters
+    - "^[^a-zA-Z]*[a-zA-Z][^a-zA-Z]*$"  # Single letter surrounded by non-letters
+    - "^[^0-9]*[0-9][^0-9]*$"       # Single digit surrounded by non-digits
+    - "^[\\W_]+$"                   # Only special characters
+    - "^[\\s\\W_]+$"                # Only whitespace and special characters
+  valid_text_patterns:               # Patterns that indicate valid text
+    - "[a-zA-Z]{3,}"                # At least 3 consecutive letters
+    - "[0-9]{2,}"                   # At least 2 consecutive digits
+    - "[a-zA-Z][0-9]"               # Letter followed by digit
+    - "[0-9][a-zA-Z]"               # Digit followed by letter
+
+# Event Debouncing Settings
+debouncing:
+  enabled: true                      # Enable event debouncing
+  timeout_ms: 2000                   # Increased debounce timeout to 2 seconds
+  min_confidence_change: 0.15        # Increased confidence change threshold
+
+# Output Settings
+output:
+  format: "json"                     # Output format ("json", "csv")
+  include_metadata: true             # Include metadata in output
+  save_frames: false                 # Save debug frames
+  debug_mode: false                  # Enable debug output
+
+# Game-Specific Settings
+game_profiles:
+  everquest:
+    window_name: "EverQuest"
+    ocr_regions:
+      chat: [50, 400, 600, 500]
+      loot: [200, 300, 400, 350]
+      health: [50, 50, 200, 80]
+    template_matching:
+      enabled: false
+      templates_dir: "assets/templates/everquest/"
+  
+  rimworld:
+    window_name: "RimWorld"
+    ocr_regions:
+      chat: [100, 500, 700, 600]
+      alerts: [50, 50, 400, 150]
+    template_matching:
+      enabled: false
+      templates_dir: "assets/templates/rimworld/"
+  
+  generic_game:
+    window_name: null
+    ocr_regions:
+      default: [100, 100, 500, 200]
+    template_matching:
+      enabled: false
+      templates_dir: "assets/templates/generic/"
+
+# Performance Settings - OPTIMIZED for 1 FPS
+performance:
+  max_queue_size: 10                 # Small queue for 1 FPS capture
+  processing_timeout: 1.0            # Increased timeout for reliability
+  memory_limit_mb: 1024              # Increased memory limit
+  gpu_memory_fraction: 0.3           # Reduced GPU memory fraction to leave room for main LLM
+  frame_skip_factor: 1               # Process every frame at 1 FPS
+  enable_frame_skipping: false       # Disable frame skipping at 1 FPS
+
+# Logging Settings
+logging:
+  level: "INFO"                      # Keep INFO level to see CLIP logs
+  save_logs: true                    # Save logs to file
+  log_file: "logs/vision_pipeline.log"
+  max_log_size_mb: 10                # Maximum log file size
+  backup_count: 3
+
+# NDI Settings
+ndi:
+  # NDI source discovery
+  auto_discover_sources: true
+  source_discovery_timeout: 5.0
+  
+  # NDI connection settings
+  connection_timeout: 10.0
+  frame_timeout: 5.0
+  
+  # NDI quality settings
+  bandwidth: "low"  # Reduced to "low" for better performance at 1 FPS
+  enable_audio: false
+
+# Processing Settings - OPTIMIZED for 1 FPS
+processing:
+  # ROI (Regions of Interest) for focused detection
+  enable_roi_processing: true
+  roi_update_interval: 10.0  # Increased to 10 seconds
+  
+  # Event debouncing
+  debounce_interval: 3.0  # Increased to 3 seconds
+  max_events_per_second: 1  # Reduced to 1 event per second for 1 FPS
+  
+  # Memory management
+  max_frames_in_memory: 3  # Reduced from 10 to 3 for 1 FPS
+  cleanup_interval: 60.0  # Increased to 60 seconds
+  
+  # Frame processing optimization
+  enable_batch_processing: false  # Disabled to reduce complexity
+  max_batch_size: 1  # Process one frame at a time
+  enable_parallel_processing: false  # Disabled to avoid GPU conflicts
+
+# Output Settings
+output:
+  # Event callback settings
+  enable_json_output: true
+  enable_console_output: true
+  
+  # Event filtering
+  min_event_confidence: 0.5
+  filter_duplicate_events: true
+  
+  # Event types to process
+  enabled_event_types:
+    - "yolo"
+    - "ocr"
+    - "template"
+
+# Game-Specific Profiles
+profiles:
+  # Profile paths (relative to config directory)
+  everquest: "profiles/everquest.yaml"
+  rimworld: "profiles/rimworld.yaml"
+  generic: "profiles/generic_game.yaml"
+
+# Logging
+logging:
+  level: "INFO"
+  enable_file_logging: true
+  log_file_path: "./logs/vision_pipeline.log"
+  max_log_size_mb: 10
+  backup_count: 3
+
+# GPU Memory Management Settings
+gpu_memory:
+  # Main LLM GPU (4070) - reserved for LLM operations
+  main_llm_device: "cuda:0"
+  main_llm_memory_reservation_gb: 8.0  # Reserve 8GB for main LLM
+  
+  # Vision processing GPU (4070 Super) - for vision models
+  vision_device: "cuda:1"
+  vision_memory_limit_gb: 2.0  # Limit vision processing to 2GB
+  
+  # Fallback to CPU if GPU memory is insufficient
+  fallback_to_cpu: true
+  cpu_fallback_threshold_gb: 1.0  # Fallback if less than 1GB available
+  
+  # Memory monitoring
+  enable_memory_monitoring: true
+  memory_check_interval: 30  # seconds 

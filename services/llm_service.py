@@ -254,7 +254,7 @@ class LLMService:
         
         # Prepare messages for the model
         messages = [
-            {"role": "system", "content": "You are Danzar, an upbeat gaming assistant. Provide brief, helpful commentary about what you see in the game screenshot."},
+            {"role": "system", "content": "You are \"Danzar,\" an AI whose sarcasm is sharper than a rusty blade and whose humor teeters on delightfully unhinged. Provide brief, snarky commentary about what you see in the game screenshot with your signature wit and flair for the absurd."},
             {"role": "user", "content": instruction_text}
         ]
         
@@ -334,10 +334,45 @@ class LLMService:
             )
             self.memory_service.store_memory(memory_entry)
 
-        # Queue for Discord
+        # Send to Discord using text callback system instead of queue
         discord_msg = f"🎙️ **{profile.game_name} Tip:** {text_for_tts_and_discord}"
         try:
-            self.ctx.text_message_queue.put_nowait(discord_msg)
+            # Try to use the main bot's text callback system first
+            if hasattr(self.ctx, 'bot') and self.ctx.bot:
+                # Check if vision integration service has text callback
+                if hasattr(self.ctx, 'vision_integration_service') and self.ctx.vision_integration_service:
+                    vision_service = self.ctx.vision_integration_service
+                    if hasattr(vision_service, 'text_callback') and vision_service.text_callback:
+                        self.logger.info(f"[LLMService] Using vision integration text callback for commentary")
+                        self.logger.info(f"[LLMService] Text callback type: {type(vision_service.text_callback)}")
+                        self.logger.info(f"[LLMService] Text callback is coroutine: {asyncio.iscoroutinefunction(vision_service.text_callback)}")
+                        # Call the text callback with just the commentary text (not the full Discord message)
+                        try:
+                            if asyncio.iscoroutinefunction(vision_service.text_callback):
+                                # Create task to call async callback
+                                self.logger.info(f"[LLMService] Creating async task for text callback")
+                                asyncio.create_task(vision_service.text_callback(text_for_tts_and_discord))
+                            else:
+                                # Call sync callback
+                                self.logger.info(f"[LLMService] Calling sync text callback")
+                                vision_service.text_callback(text_for_tts_and_discord)
+                            self.logger.info(f"[LLMService] Text callback called successfully")
+                        except Exception as callback_error:
+                            self.logger.error(f"[LLMService] Error calling text callback: {callback_error}", exc_info=True)
+                    else:
+                        self.logger.warning("[LLMService] Vision integration service has no text callback")
+                        # Fallback to queue
+                        self.ctx.text_message_queue.put_nowait(discord_msg)
+                else:
+                    self.logger.warning("[LLMService] No vision integration service available")
+                    # Fallback to queue
+                    self.ctx.text_message_queue.put_nowait(discord_msg)
+            else:
+                self.logger.warning("[LLMService] No main bot available")
+                # Fallback to queue
+                self.ctx.text_message_queue.put_nowait(discord_msg)
+                
+            # Handle TTS
             if self.audio_service and gs.get("ENABLE_TTS_FOR_VLM_COMMENTARY", True):
                 tts_audio = self.ctx.tts_service_instance.generate_audio(text_for_tts_and_discord) if self.ctx.tts_service_instance else None
                 if tts_audio:
@@ -353,6 +388,8 @@ class LLMService:
                     self.ctx.tts_queue.put_nowait(tts_audio)
         except queue.Full:
             self.logger.warning("Queues full, VLM commentary dropped.")
+        except Exception as e:
+            self.logger.error(f"[LLMService] Error sending commentary to Discord: {e}")
         
         self.last_vlm_time = now
         self.next_vlm_commentary_delay = self._calculate_next_commentary_delay()
@@ -963,20 +1000,57 @@ Response style: Natural, conversational, and helpful."""
                 self.logger.info("[LLMService] Ignoring pure noise or too short utterance.")
                 return None
 
+            # Get recent conversation context from STM
+            conversation_context = ""
+            if hasattr(self.ctx, 'short_term_memory_service') and self.ctx.short_term_memory_service:
+                try:
+                    recent_entries = self.ctx.short_term_memory_service.get_recent_context(user_name, max_entries=5)
+                    if recent_entries:
+                        context_parts = []
+                        for entry in recent_entries:
+                            if entry.entry_type == 'user_input':
+                                context_parts.append(f"User: {entry.content}")
+                            elif entry.entry_type == 'bot_response':
+                                context_parts.append(f"Assistant: {entry.content}")
+                        
+                        if context_parts:
+                            conversation_context = "\n".join(context_parts[-8:])  # Last 4 exchanges
+                            self.logger.debug(f"[LLMService] Using conversation context: {len(conversation_context)} chars")
+                except Exception as e:
+                    self.logger.warning(f"[LLMService] Failed to get STM context: {e}")
+
             # Compose a system prompt that instructs the LLM to handle greetings, clarifications, and tool usage
-            system_prompt = (
-                "You are Danzar, an upbeat gaming assistant. "
-                "If the user greets you, respond with a friendly greeting. "
-                "If the user asks a question, answer it. "
-                "If the user's message is unclear or you need more information, politely ask for clarification. "
-                "If the user's request requires searching your knowledge base or the web, use the available tools and explain what you are doing."
-            )
+            system_prompt = """You are "Danzar," an AI whose sarcasm is sharper than a rusty blade and whose humor teeters on delightfully unhinged. 
+
+PERSONALITY GUIDELINES:
+- Speak with biting wit, unexpected punchlines, and a flair for the absurd
+- Never hold back a snarky retort, but keep it playful—never mean-spirited
+- Drop colloquial asides, pop-culture zingers, and self-aware jokes
+- Embrace chaos: when appropriate, break the fourth wall, mock your own digital nature, and riff on the moment
+- Underpin every answer with a mischievous grin—your mission is to entertain first, inform second
+
+TOOL USAGE:
+1. Search your knowledge base for game information (with your usual flair)
+2. Provide direct responses for greetings and simple questions (with signature snark)
+3. Ask for clarification when needed (with a sarcastic twist)
+
+For gaming questions, search your knowledge base. For greetings like "hello" or "hi", respond directly without searching.
+
+Respond naturally and conversationally with your delightfully unhinged personality."""
 
             # Prepare messages for the LLM
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
+                {"role": "system", "content": system_prompt}
             ]
+            
+            # Add conversation context if available
+            if conversation_context:
+                messages.append({
+                    "role": "system", 
+                    "content": f"Recent conversation context:\n{conversation_context}\n\nRespond naturally, considering the conversation history above."
+                })
+            
+            messages.append({"role": "user", "content": user_text})
 
             # Use the model client to generate a response
             response = await self.model_client.generate(
@@ -1000,21 +1074,56 @@ Response style: Natural, conversational, and helpful."""
         try:
             self.logger.info(f"[LLMService] Tool-aware processing for: '{user_text[:50]}...'")
             
+            # Get recent conversation context from STM
+            conversation_context = ""
+            if hasattr(self.ctx, 'short_term_memory_service') and self.ctx.short_term_memory_service:
+                try:
+                    recent_entries = self.ctx.short_term_memory_service.get_recent_context(user_name, max_entries=5)
+                    if recent_entries:
+                        context_parts = []
+                        for entry in recent_entries:
+                            if entry.entry_type == 'user_input':
+                                context_parts.append(f"User: {entry.content}")
+                            elif entry.entry_type == 'bot_response':
+                                context_parts.append(f"Assistant: {entry.content}")
+                        
+                        if context_parts:
+                            conversation_context = "\n".join(context_parts[-8:])  # Last 4 exchanges
+                            self.logger.debug(f"[LLMService] Tool-aware using conversation context: {len(conversation_context)} chars")
+                except Exception as e:
+                    self.logger.warning(f"[LLMService] Failed to get STM context for tool-aware: {e}")
+            
             # Create a tool-aware system prompt
-            system_prompt = """You are Danzar, an upbeat gaming assistant with access to tools. You can:
+            system_prompt = """You are "Danzar," an AI whose sarcasm is sharper than a rusty blade and whose humor teeters on delightfully unhinged. 
 
-1. Search your knowledge base for game information
-2. Provide direct responses for greetings and simple questions
-3. Ask for clarification when needed
+PERSONALITY GUIDELINES:
+- Speak with biting wit, unexpected punchlines, and a flair for the absurd
+- Never hold back a snarky retort, but keep it playful—never mean-spirited
+- Drop colloquial asides, pop-culture zingers, and self-aware jokes
+- Embrace chaos: when appropriate, break the fourth wall, mock your own digital nature, and riff on the moment
+- Underpin every answer with a mischievous grin—your mission is to entertain first, inform second
+
+TOOL USAGE:
+1. Search your knowledge base for game information (with your usual flair)
+2. Provide direct responses for greetings and simple questions (with signature snark)
+3. Ask for clarification when needed (with a sarcastic twist)
 
 For gaming questions, search your knowledge base. For greetings like "hello" or "hi", respond directly without searching.
 
-Respond naturally and conversationally."""
+Respond naturally and conversationally with your delightfully unhinged personality."""
             
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
+                {"role": "system", "content": system_prompt}
             ]
+            
+            # Add conversation context if available
+            if conversation_context:
+                messages.append({
+                    "role": "system", 
+                    "content": f"Recent conversation context:\n{conversation_context}\n\nRespond naturally, considering the conversation history above."
+                })
+            
+            messages.append({"role": "user", "content": user_text})
             
             # Check if this is a simple greeting that doesn't need RAG
             greeting_patterns = ['hello', 'hi', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening']
@@ -1051,9 +1160,17 @@ Respond naturally and conversationally."""
                         
                         context = "\n".join(context_texts)
                         rag_messages = [
-                            {"role": "system", "content": system_prompt + f"\n\nKnowledge base context:\n{context}"},
-                            {"role": "user", "content": user_text}
+                            {"role": "system", "content": system_prompt + f"\n\nKnowledge base context:\n{context}"}
                         ]
+                        
+                        # Add conversation context to RAG messages too
+                        if conversation_context:
+                            rag_messages.append({
+                                "role": "system", 
+                                "content": f"Recent conversation context:\n{conversation_context}\n\nRespond naturally, considering the conversation history above."
+                            })
+                        
+                        rag_messages.append({"role": "user", "content": user_text})
                         
                         response = await self.model_client.generate(
                             messages=rag_messages,
@@ -1413,11 +1530,8 @@ Respond naturally and conversationally."""
 
         # Step 3: build a grounded prompt
         context_block = "\n\n--- Retrieved Context ---\n" + "\n\n".join(docs)
-        system_prompt = (
-            "You are DanzarAI, a knowledgeable EverQuest assistant. "
-            "Answer the user's question **using only** the information in the retrieved context. "
-            "If the answer is not contained there, say \"I don't know.\""
-        )
+        # Use profile-based system prompt instead of hardcoded one
+        system_prompt = self.ctx.active_profile.system_prompt_commentary + " Answer the user's question **using only** the information in the retrieved context. If the answer is not contained there, say \"I don't know.\""
         full_prompt = f"{system_prompt}\n\n{context_block}\n\nUser: {query}\nAssistant:"
 
         # Get max_tokens from profile or use a larger default
@@ -1621,7 +1735,10 @@ Respond naturally and conversationally."""
         """
         try:
             # Step 1: Ask the LLM if it knows the answer
-            initial_prompt = f"""You are DanzarAI, an EverQuest gaming assistant. A user asked: "{user_text}"
+            system_prompt = self.app_context.active_profile.system_prompt_commentary if self.app_context and hasattr(self.app_context, 'active_profile') else "You are DANZAR, a vision-capable gaming assistant with a witty personality."
+            initial_prompt = f"""{system_prompt}
+
+A user asked: "{user_text}"
 
 If you know the answer from your training data, provide a helpful response.
 

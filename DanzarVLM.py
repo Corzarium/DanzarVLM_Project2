@@ -4,6 +4,7 @@ DanzarVLM - AI Game Commentary and Interaction Suite with Voice Activity Detecti
 Enhanced with real-time VAD for natural conversation flow and faster-whisper STT
 """
 
+from datetime import datetime
 import asyncio
 import argparse
 import logging
@@ -29,6 +30,7 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import shutil
 
 # faster-whisper for efficient STT
 try:
@@ -63,16 +65,18 @@ except ImportError:
     OfflineVADVoiceReceiver = None
 
 # Core imports
-from core.config_loader import load_global_settings
+from core.config_loader import load_global_settings, load_game_profile
 from core.game_profile import GameProfile
 
-# Service imports  
+# Service imports
 from services.tts_service import TTSService
 from services.memory_service import MemoryService
 from services.model_client import ModelClient
-from services.llm_service import LLMService
+from services.enhanced_llm_service import EnhancedLLMService
 from services.faster_whisper_stt_service import WhisperSTTService
 from services.simple_voice_receiver import SimpleVoiceReceiver
+from services.vision_aware_conversation_service import VisionAwareConversationService
+from services.memory_manager import MemoryManager
 # VAD Voice Receiver import
 try:
     from services.vad_voice_receiver import VADVoiceReceiver
@@ -83,9 +87,25 @@ except ImportError:
 from services.short_term_memory_service import ShortTermMemoryService
 
 # MiniGPT-4 Video Service import - REMOVED
-# MiniGPT-4 has been removed from this project
+# MiniGPT-4 has been removed from this project - using Qwen2.5-VL exclusively
 MINIGPT4_VIDEO_AVAILABLE = False
 MiniGPT4VideoService = None
+
+# Backup old log file if it exists
+
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
+
+# Create timestamped backup of old log if it exists
+log_file = 'logs/danzar_voice.log'
+if os.path.exists(log_file):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_file = f'logs/danzar_voice_{timestamp}.log'
+    try:
+        shutil.move(log_file, backup_file)
+        print(f"📁 Backed up previous log to: {backup_file}")
+    except Exception as e:
+        print(f"⚠️ Could not backup log file: {e}")
 
 # Setup logging with Windows compatibility
 logging.basicConfig(
@@ -93,23 +113,32 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('logs/danzar_voice.log', mode='w', encoding='utf-8')  # Changed mode from 'a' to 'w' to reset log each run
+        logging.FileHandler(
+    'logs/danzar_voice.log',
+    mode='w',
+     encoding='utf-8')  # Always start fresh
     ]
 )
 logger = logging.getLogger("DanzarVLM")
+
+# Log startup message
+logger.info("🚀 DanzarAI starting up - Log file cleared and ready")
+logger.info(
+    f"📅 Session started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Suppress some noisy loggers
 logging.getLogger('discord').setLevel(logging.WARNING)
 logging.getLogger('discord.gateway').setLevel(logging.INFO)
 logging.getLogger('discord.voice_client').setLevel(logging.INFO)
 
+
 class SingleInstanceLock:
     """Ensures only one instance of DanzarAI can run at a time."""
-    
+
     def __init__(self, lockfile_path: str = "danzar_voice.lock"):
         self.lockfile_path = lockfile_path
         self.lockfile = None
-        
+
     def acquire(self) -> bool:
         """Acquire the lock. Returns True if successful, False if another instance is running."""
         try:
@@ -119,25 +148,27 @@ class SingleInstanceLock:
                 try:
                     with open(self.lockfile_path, 'r') as f:
                         existing_pid = f.read().strip()
-                    
+
                     # Check if process with that PID is still running
                     if self._is_process_running(existing_pid):
-                        logger.warning(f"Another instance is running with PID: {existing_pid}")
+                        logger.warning(
+                            f"Another instance is running with PID: {existing_pid}")
                         return False
                     else:
                         # Process is dead, remove stale lock file
                         os.unlink(self.lockfile_path)
                         logger.info("Removed stale lock file")
                 except Exception:
-                    # If we can't read the file, assume it's stale and remove it
+                    # If we can't read the file, assume it's stale and remove
+                    # it
                     try:
                         os.unlink(self.lockfile_path)
                     except:
                         pass
-            
+
             # Create new lock file
             self.lockfile = open(self.lockfile_path, 'w')
-            
+
             # Try to acquire exclusive lock (Windows compatible)
             if os.name == 'nt':  # Windows
                 import msvcrt
@@ -149,30 +180,33 @@ class SingleInstanceLock:
             else:  # Unix/Linux
                 try:
                     import fcntl
-                    fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(
+    self.lockfile.fileno(),
+     fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except (ImportError, IOError):
-                    # If fcntl is not available, just proceed (basic file existence check)
+                    # If fcntl is not available, just proceed (basic file
+                    # existence check)
                     pass
-            
+
             # Write PID to lockfile
             self.lockfile.write(str(os.getpid()))
             self.lockfile.flush()
-            
+
             # Register cleanup on exit
             atexit.register(self.release)
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to acquire lock: {e}")
             return False
-    
+
     def _is_process_running(self, pid_str: str) -> bool:
         """Check if a process with given PID is still running."""
         try:
             pid = int(pid_str)
             if os.name == 'nt':  # Windows
-                result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], 
+                result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'],
                                       capture_output=True, text=True)
                 return str(pid) in result.stdout
             else:  # Unix/Linux
@@ -180,7 +214,7 @@ class SingleInstanceLock:
                 return True
         except (ValueError, OSError, subprocess.SubprocessError):
             return False
-    
+
     def release(self):
         """Release the lock."""
         if self.lockfile:
@@ -188,7 +222,8 @@ class SingleInstanceLock:
                 if os.name == 'nt':  # Windows
                     import msvcrt
                     try:
-                        msvcrt.locking(self.lockfile.fileno(), msvcrt.LK_UNLCK, 1)
+                        msvcrt.locking(
+    self.lockfile.fileno(), msvcrt.LK_UNLCK, 1)
                     except:
                         pass
                 else:  # Unix/Linux
@@ -197,48 +232,59 @@ class SingleInstanceLock:
                         fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_UN)
                     except ImportError:
                         pass
-                
+
                 self.lockfile.close()
-                
+
                 # Remove lockfile
                 if os.path.exists(self.lockfile_path):
                     os.unlink(self.lockfile_path)
-                    
+
             except Exception as e:
                 logger.warning(f"Error releasing lock: {e}")
             finally:
                 self.lockfile = None
 
+
 # Global lock instance
 app_lock = SingleInstanceLock()
 
+
 class AppContext:
     """Application context for managing shared resources and services."""
-    
-    def __init__(self, global_settings: dict, active_profile: GameProfile, logger_instance: logging.Logger):
+
+    def __init__(
+    self,
+    global_settings: dict,
+    active_profile: GameProfile,
+     logger_instance: logging.Logger):
         self.global_settings = global_settings
         self.active_profile = active_profile
         self.logger = logger_instance
         self.shutdown_event = threading.Event()
-        
+
         # Add missing attributes for LLM service compatibility
         self.rag_service_instance: Optional[Any] = None
         self.is_in_conversation = threading.Event()
         self.active_profile_change_subscribers = []
-        
+
         # Service instances
         self.tts_service: Optional[TTSService] = None
         self.memory_service: Optional[MemoryService] = None
         self.model_client: Optional[ModelClient] = None
-        self.llm_service: Optional[LLMService] = None
+        self.llm_service: Optional[EnhancedLLMService] = None
         self.short_term_memory_service: Optional[ShortTermMemoryService] = None
+        # Hybrid STM+LTM memory manager
+        self.memory_manager: Optional[MemoryManager] = None
         self.faster_whisper_stt_service: Optional[Any] = None
         self.simple_voice_receiver: Optional[SimpleVoiceReceiver] = None
         self.vad_voice_receiver: Optional[Any] = None
-        self.offline_vad_voice_receiver: Optional[Any] = None  # Type will be set when available
-        self.qwen_omni_service: Optional[Any] = None  # Qwen2.5-Omni service instance
-        self.llamacpp_qwen_service: Optional[Any] = None  # LlamaCpp Qwen service instance
-        
+        # Type will be set when available
+        self.offline_vad_voice_receiver: Optional[Any] = None
+        # Qwen2.5-Omni service instance
+        self.qwen_omni_service: Optional[Any] = None
+        # LlamaCpp Qwen service instance
+        self.llamacpp_qwen_service: Optional[Any] = None
+
         logger_instance.info("[AppContext] Initialized.")
 
     def get_service(self, service_name: str):
@@ -251,7 +297,8 @@ class AppContext:
 
     def get_profile_setting(self, key: str, default=None):
         """Get a setting from the active profile."""
-        if self.active_profile and hasattr(self.active_profile, 'ocr_settings'):
+        if self.active_profile and hasattr(
+    self.active_profile, 'ocr_settings'):
             return getattr(self.active_profile, key, default)
         return default
 
@@ -262,41 +309,47 @@ class AppContext:
     def update_active_profile(self, new_profile: GameProfile):
         """Update the active profile."""
         self.active_profile = new_profile
-        self.logger.info(f"[AppContext] Active profile updated to: {new_profile.game_name}")
+        self.logger.info(
+            f"[AppContext] Active profile updated to: {new_profile.game_name}")
+
 
 class AudioFeedbackPrevention:
     """Comprehensive audio feedback prevention system to stop TTS output from being captured as input."""
-    
+
     def __init__(self, logger):
         self.logger = logger
-        
+
         # Track when we're playing TTS to ignore input during that time
         self.tts_playing = False
         self.tts_start_time = None
         self.tts_duration = 0.0
-        
+
         # Track our own TTS output text to filter it out if detected
         self.recent_tts_outputs = deque(maxlen=20)  # Increased from 10 to 20
         self.tts_output_timestamps = deque(maxlen=20)
-        
+
         # Audio signature tracking (simple approach)
         self.last_tts_audio_signature = None
-        
+
         # Reasonable silence periods after TTS
         self.post_tts_silence_duration = 3.0  # Reduced from 8.0 to 3.0 seconds
-        
+
         # Global TTS blocking - when ANY TTS is active, block ALL input
         self.global_tts_block = False
         self.global_tts_block_start = None
         self.global_tts_block_duration = 0.0
-        
-        self.logger.info("🛡️ Audio Feedback Prevention System initialized with balanced blocking")
-    
-    def start_tts_playback(self, tts_text: str, estimated_duration: Optional[float] = None):
+
+        self.logger.info(
+            "🛡️ Audio Feedback Prevention System initialized with balanced blocking")
+
+    def start_tts_playback(
+    self,
+    tts_text: str,
+     estimated_duration: Optional[float] = None):
         """Call this when starting TTS playback to prevent feedback."""
         self.tts_playing = True
         self.tts_start_time = time.time()
-        
+
         # More reasonable duration estimation
         if estimated_duration is None:
             word_count = len(tts_text.split())
@@ -304,18 +357,20 @@ class AudioFeedbackPrevention:
             self.tts_duration = max(2.0, word_count / 3.0 + 2.0)
         else:
             self.tts_duration = estimated_duration + 1.0  # Reduced buffer from 3.0 to 1.0
-        
+
         # GLOBAL TTS BLOCK - block ALL audio input
         self.global_tts_block = True
         self.global_tts_block_start = time.time()
         self.global_tts_block_duration = self.tts_duration + self.post_tts_silence_duration
-        
-        # Store the TTS text for comparison (split into words for better matching)
+
+        # Store the TTS text for comparison (split into words for better
+        # matching)
         tts_clean = tts_text.lower().strip()
         self.recent_tts_outputs.append(tts_clean)
         self.tts_output_timestamps.append(time.time())
-        
-        # Store key phrases instead of all 3-word combinations to reduce false positives
+
+        # Store key phrases instead of all 3-word combinations to reduce false
+        # positives
         words = tts_clean.split()
         if len(words) >= 4:
             # Only store the first and last few words as key phrases
@@ -325,28 +380,31 @@ class AudioFeedbackPrevention:
             self.recent_tts_outputs.append(last_phrase)
             self.tts_output_timestamps.append(time.time())
             self.tts_output_timestamps.append(time.time())
-        
-        self.logger.info(f"🛡️ TTS BLOCK ACTIVATED - blocking input for {self.global_tts_block_duration:.1f}s")
+
+        self.logger.info(
+            f"🛡️ TTS BLOCK ACTIVATED - blocking input for {self.global_tts_block_duration:.1f}s")
         self.logger.info(f"🛡️ TTS text stored: '{tts_text[:50]}...'")
-    
+
     def stop_tts_playback(self):
         """Call this when TTS playback finishes."""
         if self.tts_playing:
             actual_duration = time.time() - self.tts_start_time if self.tts_start_time else 0
-            self.logger.info(f"🛡️ TTS playback stopped - actual duration: {actual_duration:.1f}s")
-            self.logger.info(f"🛡️ Continuing block for {self.post_tts_silence_duration:.1f}s more...")
-        
+            self.logger.info(
+                f"🛡️ TTS playback stopped - actual duration: {actual_duration:.1f}s")
+            self.logger.info(
+                f"🛡️ Continuing block for {self.post_tts_silence_duration:.1f}s more...")
+
         self.tts_playing = False
         self.tts_start_time = None
         # NOTE: Don't stop global_tts_block here - let it expire naturally
-    
+
     def should_ignore_input(self) -> tuple[bool, str]:
         """
         Check if we should ignore audio input right now to prevent feedback.
         Returns (should_ignore, reason)
         """
         current_time = time.time()
-        
+
         # 1. GLOBAL TTS BLOCK - highest priority
         if self.global_tts_block and self.global_tts_block_start:
             elapsed = current_time - self.global_tts_block_start
@@ -357,7 +415,7 @@ class AudioFeedbackPrevention:
                 self.global_tts_block = False
                 self.global_tts_block_start = None
                 self.logger.info("🛡️ Global TTS block expired - input allowed")
-        
+
         # 2. Check if TTS is currently playing
         if self.tts_playing and self.tts_start_time:
             elapsed = current_time - self.tts_start_time
@@ -365,157 +423,282 @@ class AudioFeedbackPrevention:
                 return True, f"TTS playing ({elapsed:.1f}s/{self.tts_duration:.1f}s)"
             else:
                 # TTS should be done, but add post-silence period
-                if elapsed < (self.tts_duration + self.post_tts_silence_duration):
+                if elapsed < (
+    self.tts_duration +
+     self.post_tts_silence_duration):
                     return True, f"Post-TTS silence ({elapsed:.1f}s/{self.tts_duration + self.post_tts_silence_duration:.1f}s)"
                 else:
                     # TTS is definitely done
                     self.stop_tts_playback()
-        
+
         # 3. Check recent TTS timestamps for additional safety
         for tts_time in self.tts_output_timestamps:
             time_since_tts = current_time - tts_time
             if time_since_tts < self.post_tts_silence_duration:
                 return True, f"Recent TTS cooldown ({time_since_tts:.1f}s < {self.post_tts_silence_duration:.1f}s)"
-        
+
         return False, "Input allowed"
-    
+
     def is_likely_tts_echo(self, transcription: str) -> tuple[bool, str]:
         """
-        Check if a transcription is likely an echo of our own TTS output.
-        Returns (is_echo, reason)
+        Intelligent TTS echo detection using heuristics and context analysis.
+
+        This method analyzes whether a transcription is likely an echo
+        of our own TTS output rather than legitimate user speech.
         """
-        if not transcription or len(transcription.strip()) < 3:
-            return False, "Too short to analyze"
-        
         transcription_clean = transcription.lower().strip()
-        
-        # Check against recent TTS outputs with aggressive matching for exact/substring matches
-        for i, tts_output in enumerate(self.recent_tts_outputs):
-            # Exact match - definitely an echo
-            if transcription_clean == tts_output:
+
+        # Quick length check - very long transcriptions are unlikely to be
+        # echoes
+        if len(transcription_clean) > 100:
+            return False, "Long transcription unlikely to be echo"
+
+        # Quick check for exact matches with recent TTS output
+        current_time = time.time()
+        for i, (tts_text, timestamp) in enumerate(
+            zip(self.recent_tts_outputs, self.tts_output_timestamps)):
+            if current_time - timestamp > 30.0:  # Only check last 30 seconds
+                continue
+
+            tts_clean = tts_text.lower().strip()
+
+            # Exact match check
+            if transcription_clean == tts_clean:
                 return True, f"EXACT match with recent TTS output #{i}"
-            
-            # Substring match - very likely an echo
-            if len(transcription_clean) > 5 and len(tts_output) > 5:
-                if transcription_clean in tts_output or tts_output in transcription_clean:
-                    return True, f"SUBSTRING match with recent TTS output #{i}"
-            
-            # Word similarity - only for very high similarity (80%+)
-            if len(transcription_clean) > 10 and len(tts_output) > 10:
+
+            # Check for very high word overlap (90%+) with recent TTS
+            if len(transcription_clean) > 10 and len(tts_clean) > 10:
                 trans_words = set(transcription_clean.split())
-                tts_words = set(tts_output.split())
-                
-                if len(trans_words) > 0 and len(tts_words) > 0:
+                tts_words = set(tts_clean.split())
+
+                if len(trans_words) >= 3 and len(tts_words) >= 3:
+                    matching_words = len(trans_words.intersection(tts_words))
+                    total_unique_words = len(trans_words.union(tts_words))
+
+                    if total_unique_words > 0:
+                        overlap_ratio = matching_words / total_unique_words
+                        if overlap_ratio >= 0.9:  # 90% word overlap
+                            return True, f"HIGH word overlap ({overlap_ratio:.1%}) with recent TTS output #{i}"
+
+        # Use intelligent heuristic detection for ambiguous cases
+        return self._heuristic_echo_detection(transcription_clean)
+
+    def _heuristic_echo_detection(
+        self, transcription: str) -> tuple[bool, str]:
+        """
+        Use intelligent heuristics to detect if transcription is likely a TTS echo.
+
+        This method analyzes content patterns, context, and speech characteristics
+        to determine if the speech is likely an echo of our own TTS output.
+        """
+        # Get recent TTS context for analysis
+        current_time = time.time()
+        recent_tts_texts = []
+
+        # Collect recent TTS outputs (last 60 seconds)
+        for tts_text, timestamp in zip(
+    self.recent_tts_outputs, self.tts_output_timestamps):
+            if current_time - timestamp <= 60.0:
+                recent_tts_texts.append(tts_text.lower())
+
+        # Heuristic 1: Check for TTS-specific phrases that are unlikely to be
+        # user speech
+        tts_specific_phrases = [
+            # System identification phrases
+            "i'm danzar", "danzarai", "gaming assistant", "ai assistant",
+            "i'm an ai", "i'm an assistant", "i'm here to help",
+
+            # TTS response patterns
+            "that's interesting", "let me help you", "i understand",
+            "first they mentioned", "user is confident", "prep expansions ready",
+            "detailed spreadsheet for platinum", "they want to crush goals",
+            "looking at the tools provided", "there's info on necromancer",
+            "they mentioned", "looking to maximize their", "so they're probably",
+            "the user is confident with their",
+
+            # Very specific TTS artifacts
+            "boxing games are fantastic for more than just entertainment",
+            "that's right boxing games are not just fun",
+            "i heard you say", "as you mentioned", "you mentioned",
+
+            # TTS processing phrases
+            "processing that", "trouble processing", "try again",
+            "please try again", "error processing", "audio transcription failed",
+            "i encountered an error", "that right now", "sorry to hear",
+            "clarify what", "i'm having trouble processing"
+        ]
+
+        # Check for exact phrase matches
+        for phrase in tts_specific_phrases:
+            if phrase in transcription:
+                return True, f"TTS-specific phrase detected: '{phrase}'"
+
+        # Heuristic 2: Check for high similarity with recent TTS outputs
+        if recent_tts_texts:
+            # Calculate similarity scores with recent TTS outputs
+            max_similarity = 0.0
+            most_similar_tts = ""
+
+            for tts_text in recent_tts_texts:
+                # Simple word-based similarity
+                trans_words = set(transcription.split())
+                tts_words = set(tts_text.split())
+
+                if len(trans_words) >= 2 and len(tts_words) >= 2:
                     intersection = len(trans_words.intersection(tts_words))
                     union = len(trans_words.union(tts_words))
-                    similarity = intersection / union if union > 0 else 0
-                    
-                    if similarity > 0.8:  # Raised back to 80% for word similarity
-                        return True, f"HIGH similarity ({similarity:.1%}) with recent TTS output #{i}"
-                
-                # Word match - only for extremely high word overlap (85%+)
-                if len(trans_words) >= 4 and len(tts_words) >= 4:  # Require longer phrases
-                    matching_words = sum(1 for word in trans_words if word in tts_words)
-                    match_ratio = matching_words / len(trans_words)
-                    if match_ratio >= 0.85:  # Raised from 50% to 85% to prevent false positives
-                        return True, f"WORD match ({match_ratio:.1%}) with recent TTS output #{i}"
-        
-        # Enhanced TTS echo patterns - very specific to avoid false positives
-        echo_patterns = [
-            # Exact TTS response patterns (very specific)
-            "i heard you say", "i'm danzar", "danzarai",
-            "gaming assistant", "how can i help",
-            "that's interesting", "let me help you", "i understand",
-            # EverQuest TTS-specific phrases (from actual TTS responses) - removed generic terms
-            "first they mentioned", "user is confident", "prep expansions ready",
-            "detailed spreadsheet for platinum", 
-            "they want to crush goals", "looking at the tools provided",
-            "there's info on necromancer", "they mentioned",
-            # Common TTS response starters
-            "looking to maximize their", "so they're probably",
-            "the user is confident with their",
-            # Very specific TTS artifacts that shouldn't be user input
-            "boxing games are fantastic for more than just entertainment",
-            "that's right boxing games are not just fun"
+
+                    if union > 0:
+                        similarity = intersection / union
+                        if similarity > max_similarity:
+                            max_similarity = similarity
+                            most_similar_tts = tts_text[:50] + \
+                                "..." if len(tts_text) > 50 else tts_text
+
+            # If similarity is very high (>80%), likely an echo
+            if max_similarity > 0.8:
+                return True, f"High similarity ({max_similarity:.1%}) with recent TTS: '{most_similar_tts}'"
+
+        # Heuristic 3: Check for unnatural speech patterns
+        # TTS echoes often have very formal or repetitive patterns
+        words = transcription.split()
+
+        # Check for excessive repetition
+        if len(words) >= 3:
+            word_counts = {}
+            for word in words:
+                word_counts[word] = word_counts.get(word, 0) + 1
+
+            # If any word appears more than 50% of the time, suspicious
+            max_word_count = max(word_counts.values())
+            if max_word_count > len(words) * 0.5:
+                return True, f"Excessive word repetition detected"
+
+        # Heuristic 4: Check for TTS artifacts in word patterns
+        # TTS often has very specific patterns that users don't naturally use
+        tts_artifact_patterns = [
+            # Very formal or robotic patterns
+            r"\b(i am|i'm) (an|a) (ai|assistant|bot)\b",
+            r"\b(that is|that's) (very|quite) (interesting|fascinating)\b",
+            r"\b(let me) (help|assist) (you|you with)\b",
+            r"\b(i understand|i see) (that|what) (you|you're)\b",
+
+            # TTS-specific response patterns
+            r"\b(first|initially) (they|the user) (mentioned|said)\b",
+            r"\b(user|they) (is|are) (confident|planning)\b",
+            r"\b(looking|aiming) (to|at) (maximize|optimize)\b",
+
+            # Processing-related patterns
+            r"\b(processing|analyzing) (that|the) (request|input)\b",
+            r"\b(having|encountering) (trouble|difficulty) (processing|with)\b"
         ]
-        
-        # Check for pattern matches - only exact or very close matches
-        for pattern in echo_patterns:
-            # Exact match
-            if transcription_clean == pattern:
-                return True, f"EXACT TTS echo pattern: '{pattern}'"
-            # Very close match (pattern is 70%+ of the transcription)
-            if pattern in transcription_clean and len(pattern) / len(transcription_clean) > 0.7:
-                return True, f"DOMINANT TTS echo pattern: '{pattern}'"
-        
-        # Check for common single-word TTS echoes only if they're the entire transcription
-        # Reduced to only very specific system words that shouldn't be user input
-        single_word_echoes = ["danzar", "danzarai"]  # Removed game terms that users might legitimately say
-        if transcription_clean in single_word_echoes:
-            return True, f"SINGLE-WORD TTS echo: '{transcription_clean}'"
-        
-        return False, "Not detected as echo"
-    
+
+        import re
+        for pattern in tts_artifact_patterns:
+            if re.search(pattern, transcription):
+                return True, f"TTS artifact pattern detected: '{pattern}'"
+
+        # Heuristic 5: Length and complexity analysis
+        # Very short transcriptions that are common words might be echoes
+        if len(transcription) <= 20:
+            common_echo_words = [
+    "danzar",
+    "danzarai",
+    "assistant",
+    "ai",
+    "bot",
+     "help"]
+            if transcription in common_echo_words:
+                return True, f"Short echo word detected: '{transcription}'"
+
+        # Heuristic 6: Context timing analysis
+        # If we just finished TTS and this transcription appears immediately,
+        # more likely echo
+        if self.tts_output_timestamps:
+            last_tts_time = self.tts_output_timestamps[-1]
+            time_since_tts = current_time - last_tts_time
+
+            # If transcription appears within 5 seconds of TTS, be more
+            # suspicious
+            if time_since_tts < 5.0:
+                # Check if it's a very short transcription that could be TTS
+                # artifact
+                if len(transcription) <= 30:
+                    # Look for common TTS artifacts in short transcriptions
+                    short_echo_indicators = [
+                        "um", "uh", "ah", "oh", "mm", "hmm", "hm", "eh", "er",
+                        "yes", "no", "okay", "ok", "right", "sure", "yeah"
+                    ]
+                    if transcription in short_echo_indicators:
+                        return True, f"Short TTS artifact detected shortly after TTS: '{transcription}'"
+
+        # Default to allowing the transcription
+        return False, "No echo indicators detected, allowing"
+
     def cleanup_old_entries(self):
         """Clean up old TTS entries to prevent memory buildup."""
         current_time = time.time()
-        cutoff_time = current_time - 60.0  # Keep last 60 seconds (increased from 30)
-        
+        # Keep last 60 seconds (increased from 30)
+        cutoff_time = current_time - 60.0
+
         # Remove old timestamps
         while self.tts_output_timestamps and self.tts_output_timestamps[0] < cutoff_time:
             self.tts_output_timestamps.popleft()
             if self.recent_tts_outputs:
                 self.recent_tts_outputs.popleft()
 
+
 class WhisperAudioCapture:
     """Captures audio from virtual audio cables and processes with Whisper STT only."""
-    
+
     def __init__(self, app_context: AppContext, callback_func=None):
         self.app_context = app_context
         self.logger = app_context.logger
         self.callback_func = callback_func
-        
+
         # Audio settings optimized for Whisper
         self.sample_rate = 16000  # Whisper's native sample rate
         self.channels = 1  # Mono for Whisper
         self.chunk_size = 1024  # Smaller chunks for real-time processing
         self.dtype = np.float32
-        
+
         # Speech detection settings (simple level-based) - BALANCED
-        self.speech_threshold = 0.10  # Lower threshold for easier detection (was 0.15)
+        # Lower threshold for easier detection (was 0.15)
+        self.speech_threshold = 0.10
         self.min_speech_duration = 1.0  # Shorter minimum duration (was 1.5)
         self.max_silence_duration = 2.5  # Longer silence tolerance (was 2.0)
-        
+
         # State tracking
         self.is_recording = False
         self.is_speaking = False
         self.speech_start_time = None
         self.last_speech_time = None
         self.audio_buffer = []
-        
+
         # Audio device
         self.input_device = None
         self.stream = None
-        
+
         # Processing queue
         self.audio_queue = queue.Queue()
         self.processing_thread = None
-        
+
         # Transcription results queue for Discord bot
         self.transcription_queue = queue.Queue()
-        
+
         # Whisper model
         self.whisper_model = None
-        
+
     def list_audio_devices(self):
         """List all available audio input devices."""
         if not VIRTUAL_AUDIO_AVAILABLE or sd is None:
-            self.logger.error("❌ sounddevice not available - install with: pip install sounddevice")
+            self.logger.error(
+                "❌ sounddevice not available - install with: pip install sounddevice")
             return []
-            
+
         self.logger.info("🎵 Available Audio Input Devices:")
         devices = sd.query_devices()
-        
+
         virtual_devices = []
         for i, device in enumerate(devices):
             try:
@@ -525,92 +708,105 @@ class WhisperAudioCapture:
                 else:
                     max_channels = getattr(device, 'max_input_channels', 0)
                     device_name = getattr(device, 'name', f'Device {i}')
-                
+
                 if max_channels > 0:  # Input device
-                    self.logger.info(f"  {i}: {device_name} (channels: {max_channels})")
-                    
+                    self.logger.info(
+                        f"  {i}: {device_name} (channels: {max_channels})")
+
                     # Look for virtual audio cables
-                    if any(keyword in device_name.lower() for keyword in 
+                    if any(keyword in device_name.lower() for keyword in
                           ['cable', 'virtual', 'vb-audio', 'voicemeeter', 'stereo mix', 'wave out mix', 'what u hear']):
                         virtual_devices.append((i, device_name))
-                        self.logger.info(f"      ⭐ VIRTUAL AUDIO DEVICE DETECTED")
+                        self.logger.info(
+                            f"      ⭐ VIRTUAL AUDIO DEVICE DETECTED")
             except Exception as e:
                 self.logger.warning(f"⚠️  Could not process device {i}: {e}")
                 continue
-        
+
         if virtual_devices:
             self.logger.info("🎯 Recommended Virtual Audio Devices:")
             for device_id, device_name in virtual_devices:
                 self.logger.info(f"  Device {device_id}: {device_name}")
         else:
-            self.logger.warning("⚠️  No virtual audio devices detected. Install VB-Cable or enable Stereo Mix.")
-            
+            self.logger.warning(
+                "⚠️  No virtual audio devices detected. Install VB-Cable or enable Stereo Mix.")
+
         return virtual_devices
-    
+
     def select_input_device(self, device_id: Optional[int] = None):
         """Select audio input device."""
         if not VIRTUAL_AUDIO_AVAILABLE or sd is None:
             self.logger.error("❌ sounddevice not available")
             return False
-            
+
         if device_id is None:
-            # Use the working VB-Audio device (Device 8: CABLE Output VB-Audio Virtual Cable)
+            # Use the working VB-Audio device (Device 8: CABLE Output VB-Audio
+            # Virtual Cable)
             working_device_id = 8
-            
+
             # Check if the working device is available
             virtual_devices = self.list_audio_devices()
             working_device_found = False
-            
+
             for dev_id, dev_name in virtual_devices:
                 if dev_id == working_device_id:
                     device_id = working_device_id
                     working_device_found = True
                     self.logger.info(f"✅ Selected audio device: {dev_name}")
-                    self.logger.info(f"🎯 Using working VB-Audio device: {dev_name}")
+                    self.logger.info(
+                        f"🎯 Using working VB-Audio device: {dev_name}")
                     break
-            
+
             if not working_device_found and virtual_devices:
                 # Fallback to first available virtual device
                 device_id = virtual_devices[0][0]
-                self.logger.info(f"🎯 Auto-selected virtual audio device: {device_id}")
+                self.logger.info(
+                    f"🎯 Auto-selected virtual audio device: {device_id}")
             elif not working_device_found:
                 # Fall back to default device
                 try:
                     device_id = sd.default.device[0]
-                    self.logger.warning(f"⚠️  Using default input device: {device_id}")
+                    self.logger.warning(
+                        f"⚠️  Using default input device: {device_id}")
                 except Exception:
                     device_id = 0  # Fallback to device 0
                     self.logger.warning("⚠️  Using device 0 as fallback")
-        
+
         try:
             device_info = sd.query_devices(device_id, 'input')
             self.input_device = device_id
-            device_name = device_info.get('name', f'Device {device_id}') if isinstance(device_info, dict) else str(device_info)
+            device_name = device_info.get(
+    'name', f'Device {device_id}') if isinstance(
+        device_info, dict) else str(device_info)
             self.logger.info(f"✅ Selected audio device: {device_name}")
             return True
         except Exception as e:
             self.logger.error(f"❌ Failed to select device {device_id}: {e}")
             return False
-    
+
     async def initialize_whisper(self, model_size: str = "large"):
         """Initialize Whisper model with GPU acceleration."""
         try:
-            self.logger.info(f"🔧 Loading Whisper model '{model_size}' with GPU acceleration...")
-            self.logger.info("💡 Available models: tiny, base, small, medium, large")
-            self.logger.info("💡 Accuracy: tiny < base < small < medium < large")
+            self.logger.info(
+                f"🔧 Loading Whisper model '{model_size}' with GPU acceleration...")
+            self.logger.info(
+                "💡 Available models: tiny, base, small, medium, large")
+            self.logger.info(
+                "💡 Accuracy: tiny < base < small < medium < large")
             self.logger.info("💡 Speed: large < medium < small < base < tiny")
-            
+
             # Get GPU configuration from settings
-            whisper_gpu_config = self.app_context.global_settings.get('WHISPER_GPU_CONFIG', {})
+            whisper_gpu_config = self.app_context.global_settings.get(
+                'WHISPER_GPU_CONFIG', {})
             preferred_device = whisper_gpu_config.get('device', 'cuda:0')
             compute_type = whisper_gpu_config.get('compute_type', 'float16')
-            
+
             self.logger.info(f"🎯 Preferred GPU device: {preferred_device}")
             self.logger.info(f"🎯 Compute type: {compute_type}")
-            
+
             loop = asyncio.get_event_loop()
             start_time = time.time()
-            
+
             if WHISPER_AVAILABLE and whisper:
                 # Load model with GPU acceleration
                 def load_whisper_with_gpu():
@@ -620,97 +816,141 @@ class WhisperAudioCapture:
                         if torch.cuda.is_available():
                             # Check available GPUs and their memory
                             gpu_count = torch.cuda.device_count()
-                            self.logger.info(f"🎯 Found {gpu_count} CUDA devices")
-                            
+                            self.logger.info(
+                                f"🎯 Found {gpu_count} CUDA devices")
+
                             # Try preferred device first
                             try:
-                                device_id = int(preferred_device.split(':')[1]) if ':' in preferred_device else 0
+                                device_id = int(
+    preferred_device.split(':')[1]) if ':' in preferred_device else 0
                                 if device_id < gpu_count:
                                     # Check memory on preferred device
                                     torch.cuda.set_device(device_id)
-                                    memory_allocated = torch.cuda.memory_allocated(device_id)
-                                    memory_reserved = torch.cuda.memory_reserved(device_id)
-                                    memory_total = torch.cuda.get_device_properties(device_id).total_memory
+                                    memory_allocated = torch.cuda.memory_allocated(
+                                        device_id)
+                                    memory_reserved = torch.cuda.memory_reserved(
+                                        device_id)
+                                    memory_total = torch.cuda.get_device_properties(
+                                        device_id).total_memory
                                     memory_free = memory_total - memory_reserved
-                                    
-                                    self.logger.info(f"🎯 GPU {device_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
-                                    
-                                    # If we have enough memory (at least 2GB free), use this device
+
+                                    self.logger.info(
+                                        f"🎯 GPU {device_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
+
+                                    # If we have enough memory (at least 2GB
+                                    # free), use this device
                                     if memory_free > 2 * 1024**3:  # 2GB
-                                        self.logger.info(f"✅ Using preferred GPU {device_id} for Whisper")
-                                        return whisper.load_model(model_size, device=preferred_device)
+                                        self.logger.info(
+                                            f"✅ Using preferred GPU {device_id} for Whisper")
+                                        return whisper.load_model(
+                                            model_size, device=preferred_device)
                                     else:
-                                        self.logger.warning(f"⚠️ GPU {device_id} has insufficient memory ({memory_free/1024**3:.1f}GB free)")
+                                        self.logger.warning(
+                                            f"⚠️ GPU {device_id} has insufficient memory ({memory_free/1024**3:.1f}GB free)")
                             except Exception as e:
-                                self.logger.warning(f"⚠️ Failed to use preferred device {preferred_device}: {e}")
-                            
+                                self.logger.warning(
+                                    f"⚠️ Failed to use preferred device {preferred_device}: {e}")
+
                             # Try to find a GPU with enough memory
                             for gpu_id in range(gpu_count):
                                 try:
                                     torch.cuda.set_device(gpu_id)
-                                    memory_allocated = torch.cuda.memory_allocated(gpu_id)
-                                    memory_reserved = torch.cuda.memory_reserved(gpu_id)
-                                    memory_total = torch.cuda.get_device_properties(gpu_id).total_memory
+                                    memory_allocated = torch.cuda.memory_allocated(
+                                        gpu_id)
+                                    memory_reserved = torch.cuda.memory_reserved(
+                                        gpu_id)
+                                    memory_total = torch.cuda.get_device_properties(
+                                        gpu_id).total_memory
                                     memory_free = memory_total - memory_reserved
-                                    
-                                    self.logger.info(f"🎯 GPU {gpu_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
-                                    
+
+                                    self.logger.info(
+                                        f"🎯 GPU {gpu_id} memory: {memory_free/1024**3:.1f}GB free / {memory_total/1024**3:.1f}GB total")
+
                                     if memory_free > 2 * 1024**3:  # 2GB free
                                         device_str = f"cuda:{gpu_id}"
-                                        self.logger.info(f"✅ Using GPU {gpu_id} for Whisper (device: {device_str})")
-                                        return whisper.load_model(model_size, device=device_str)
+                                        self.logger.info(
+                                            f"✅ Using GPU {gpu_id} for Whisper (device: {device_str})")
+                                        return whisper.load_model(
+                                            model_size, device=device_str)
                                 except Exception as e:
-                                    self.logger.warning(f"⚠️ Failed to check GPU {gpu_id}: {e}")
+                                    self.logger.warning(
+                                        f"⚠️ Failed to check GPU {gpu_id}: {e}")
                                     continue
-                            
+
                             # If no GPU has enough memory, try CPU
-                            self.logger.warning("⚠️ No GPU has sufficient memory, falling back to CPU")
+                            self.logger.warning(
+                                "⚠️ No GPU has sufficient memory, falling back to CPU")
                             return whisper.load_model(model_size, device="cpu")
                         else:
-                            self.logger.warning("⚠️ CUDA not available, falling back to CPU")
+                            self.logger.warning(
+                                "⚠️ CUDA not available, falling back to CPU")
                             return whisper.load_model(model_size, device="cpu")
                     except Exception as e:
-                        self.logger.warning(f"⚠️ GPU loading failed, falling back to CPU: {e}")
+                        self.logger.warning(
+                            f"⚠️ GPU loading failed, falling back to CPU: {e}")
                         return whisper.load_model(model_size, device="cpu")
-                
+
                 self.whisper_model = await loop.run_in_executor(None, load_whisper_with_gpu)
             else:
                 raise Exception("Whisper not available")
-                
+
             load_time = time.time() - start_time
-            
-            self.logger.info(f"✅ Whisper model '{model_size}' loaded successfully in {load_time:.1f}s")
-            
+
+            self.logger.info(
+                f"✅ Whisper model '{model_size}' loaded successfully in {load_time:.1f}s")
+
             # Show model info and device
             if hasattr(self.whisper_model, 'dims'):
                 dims = self.whisper_model.dims
-                self.logger.info(f"📊 Model info: {dims.n_audio_ctx} audio tokens, {dims.n_text_ctx} text tokens")
-            
+                self.logger.info(
+                    f"📊 Model info: {dims.n_audio_ctx} audio tokens, {dims.n_text_ctx} text tokens")
+
             # Check if model is on GPU
-            if hasattr(self.whisper_model, 'model') and hasattr(self.whisper_model.model, 'device'):
+            if hasattr(
+    self.whisper_model,
+    'model') and hasattr(
+        self.whisper_model.model,
+         'device'):
                 device_info = str(self.whisper_model.model.device)
                 self.logger.info(f"🎯 Model loaded on device: {device_info}")
-            
+
             return True
         except Exception as e:
             self.logger.error(f"❌ Whisper initialization failed: {e}")
             return False
-    
+
     def detect_speech(self, audio_chunk: np.ndarray) -> tuple[bool, bool]:
-        """Simple level-based speech detection."""
+        """Enhanced level-based speech detection with better debugging."""
         try:
             # Calculate RMS (Root Mean Square) for volume detection
             rms = np.sqrt(np.mean(np.square(audio_chunk)))
-            
+
+            # Also calculate peak amplitude for better detection
+            peak_amplitude = np.max(np.abs(audio_chunk))
+
             current_time = time.time()
-            is_speech = rms > self.speech_threshold
+
+            # Use both RMS and peak for more robust detection
+            is_speech = (rms > self.speech_threshold) or (
+                peak_amplitude > self.speech_threshold * 2)
             speech_ended = False
-            
+
+            # Add periodic debugging (every 100 chunks to avoid spam)
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 0
+
+            if self._debug_counter % 100 == 0:
+                self.logger.debug(
+                    f"🎤 Audio levels - RMS: {rms:.4f}, Peak: {peak_amplitude:.4f}, Threshold: {self.speech_threshold:.4f}, Is Speech: {is_speech}")
+
             if is_speech:
                 if not self.is_speaking:
                     self.is_speaking = True
                     self.speech_start_time = current_time
-                    self.logger.info(f"🎤 Speech started (RMS: {rms:.4f})")
+                    self.logger.info(
+                        f"🎤 Speech started (RMS: {rms:.4f}, Peak: {peak_amplitude:.4f})")
                 self.last_speech_time = current_time
             elif self.is_speaking and self.last_speech_time:
                 silence_duration = current_time - self.last_speech_time
@@ -719,132 +959,191 @@ class WhisperAudioCapture:
                         speech_duration = current_time - self.speech_start_time
                         if speech_duration >= self.min_speech_duration:
                             speech_ended = True
-                            self.logger.info(f"🎤 Speech ended (duration: {speech_duration:.2f}s)")
-                    
+                            self.logger.info(
+                                f"🎤 Speech ended (duration: {speech_duration:.2f}s, silence: {silence_duration:.2f}s)")
+
                     self.is_speaking = False
                     self.speech_start_time = None
                     self.last_speech_time = None
-            
+
             return is_speech, speech_ended
-            
+
         except Exception as e:
             self.logger.error(f"❌ Speech detection error: {e}")
             return False, False
-    
+
     def audio_callback(self, indata, frames, time_info, status):
         """Audio callback for sounddevice stream."""
         if status:
             self.logger.warning(f"⚠️  Audio callback status: {status}")
-        
+
         try:
             # Convert stereo to mono if needed
             if len(indata.shape) > 1:
                 audio_mono = np.mean(indata, axis=1)
             else:
                 audio_mono = indata.copy()
-            
+
+            # Add periodic debug logging (every 1000 callbacks to avoid spam)
+            if hasattr(self, '_callback_counter'):
+                self._callback_counter += 1
+            else:
+                self._callback_counter = 0
+
+            if self._callback_counter % 1000 == 0:
+                rms = np.sqrt(np.mean(np.square(audio_mono)))
+                self.logger.debug(
+                    f"🎵 Audio callback #{self._callback_counter}: RMS={rms:.4f}, frames={frames}")
+
             # Add audio to queue for processing
             self.audio_queue.put(audio_mono.flatten())
         except Exception as e:
             self.logger.error(f"❌ Audio callback error: {e}")
-    
+
     def processing_worker(self):
         """Worker thread for processing audio chunks."""
         self.logger.info("🎯 Whisper audio processing worker started")
-        
+
+        chunk_count = 0
+        last_debug_time = time.time()
+
         while self.is_recording:
             try:
                 # Get audio chunk with timeout
+                self.logger.debug("🎵 Waiting for audio chunk...")
                 audio_chunk = self.audio_queue.get(timeout=1.0)
-                
-                # Detect speech using simple level-based detection
+                chunk_count += 1
+
+                # Log every chunk for debugging
+                self.logger.debug(
+                    f"🎵 Received audio chunk #{chunk_count} (size: {len(audio_chunk)})")
+
+                # Periodic debug logging (every 50 chunks or every 5 seconds)
+                current_time = time.time()
+                if chunk_count % 50 == 0 or (
+    current_time - last_debug_time) > 5:
+                    self.logger.debug(
+                        f"🎵 Processing chunk {chunk_count}, buffer size: {len(self.audio_buffer)}, is_speaking: {self.is_speaking}")
+                    last_debug_time = current_time
+
+                # Detect speech using enhanced level-based detection
                 is_speech, speech_ended = self.detect_speech(audio_chunk)
-                
+
                 # Always add to buffer when speaking
                 if self.is_speaking:
                     self.audio_buffer.extend(audio_chunk)
-                
+                    if chunk_count % 10 == 0:  # Log every 10th chunk when speaking
+                        self.logger.debug(
+                            f"🎤 Adding audio to buffer (size: {len(self.audio_buffer)})")
+
                 # Process complete speech segments
                 if speech_ended and len(self.audio_buffer) > 0:
                     # Convert buffer to numpy array
-                    speech_audio = np.array(self.audio_buffer, dtype=np.float32)
+                    speech_audio = np.array(
+    self.audio_buffer, dtype=np.float32)
+                    buffer_size = len(self.audio_buffer)
                     self.audio_buffer.clear()
                     self.is_speaking = False
-                    self.logger.info(f"🎤 Speech ended (duration: {len(speech_audio) / self.sample_rate:.2f}s)")
-                    
+                    self.logger.info(
+                        f"🎤 Processing speech segment (duration: {len(speech_audio) / self.sample_rate:.2f}s, samples: {len(speech_audio)})")
+
                     # Process with local Whisper model directly
                     try:
-                        self.logger.info("🎯 Processing speech audio with local Whisper...")
-                        
+                        self.logger.info(
+                            "🎯 Processing speech audio with local Whisper...")
+
                         # Use local Whisper model directly in this thread
-                        if hasattr(self, 'whisper_model') and self.whisper_model:
+                        if hasattr(
+    self, 'whisper_model') and self.whisper_model:
                             try:
-                                # Run Whisper transcription directly in this thread
-                                result = self.whisper_model.transcribe(speech_audio)
-                                
-                                if result and isinstance(result, dict) and 'text' in result:
+                                # Run Whisper transcription directly in this
+                                # thread
+                                result = self.whisper_model.transcribe(
+                                    speech_audio)
+
+                                if result and isinstance(
+                                    result, dict) and 'text' in result:
                                     transcription = str(result['text']).strip()
                                     if transcription:
-                                        self.logger.info(f"✅ Local Whisper transcription: '{transcription}'")
-                                        # Put the transcription in the queue for Discord bot to process
-                                        if hasattr(self, 'transcription_queue') and self.transcription_queue:
-                                            self.transcription_queue.put(transcription)
+                                        self.logger.info(
+                                            f"✅ Local Whisper transcription: '{transcription}'")
+                                        # Put the transcription in the queue
+                                        # for Discord bot to process
+                                        if hasattr(
+    self, 'transcription_queue') and self.transcription_queue:
+                                            self.transcription_queue.put(
+                                                transcription)
+                                            self.logger.info(
+                                                f"📤 Added transcription to queue: '{transcription}'")
                                         else:
-                                            self.logger.warning("No transcription queue available to handle transcription.")
+                                            self.logger.warning(
+                                                "No transcription queue available to handle transcription.")
                                     else:
-                                        self.logger.info("🔇 Empty transcription from local Whisper")
+                                        self.logger.info(
+                                            "🔇 Empty transcription from local Whisper")
                                 else:
-                                    self.logger.info("🔇 No transcription from local Whisper")
+                                    self.logger.info(
+                                        "🔇 No transcription from local Whisper")
                             except Exception as e:
-                                self.logger.error(f"❌ Local Whisper error: {e}")
+                                self.logger.error(
+                                    f"❌ Local Whisper error: {e}")
                         else:
-                            self.logger.warning("⚠️ Local Whisper model not available")
-                            
+                            self.logger.warning(
+                                "⚠️ Local Whisper model not available")
+
                     except Exception as e:
                         self.logger.error(f"❌ Processing error: {e}")
-                        
+
             except queue.Empty:
+                # Log when no audio chunks are received for extended periods
+                if chunk_count > 0 and chunk_count % 200 == 0:
+                    self.logger.debug(
+                        f"🎵 No audio chunks received for 200 iterations (chunk_count: {chunk_count})")
                 continue
             except Exception as e:
                 self.logger.error(f"❌ Processing worker error: {e}")
                 continue
 
-    def _transcribe_with_omni_sync(self, audio_data: np.ndarray) -> Optional[str]:
+    def _transcribe_with_omni_sync(
+    self, audio_data: np.ndarray) -> Optional[str]:
         """Synchronous version of Qwen2.5-Omni transcription for worker threads."""
         try:
             # Save audio to temporary file for Omni
             import tempfile
             import scipy.io.wavfile as wavfile
             import asyncio
-            
+
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
                 # Convert numpy array to WAV format
-                audio_int16 = np.clip(audio_data * 32767, -32767, 32767).astype(np.int16)
+                audio_int16 = np.clip(
+                    audio_data * 32767, -32767, 32767).astype(np.int16)
                 wavfile.write(temp_file.name, 16000, audio_int16)
                 temp_file_path = temp_file.name
-            
-            self.logger.info(f"🎵 Saved audio to {temp_file_path}, processing with Qwen2.5-Omni sync...")
-            
+
+            self.logger.info(
+                f"🎵 Saved audio to {temp_file_path}, processing with Qwen2.5-Omni sync...")
+
             # Create a new event loop for this thread and run the async call
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
+
             try:
                 # Run the async Qwen2.5-Omni call in this thread's event loop
                         # Qwen2.5-Omni service not available
-                        self.logger.warning("⚠️ Qwen2.5-Omni service not available")
+                        self.logger.warning(
+                            "⚠️ Qwen2.5-Omni service not available")
                         response = None
             finally:
                 loop.close()
-            
+
             # Clean up temporary file
             import os
             os.unlink(temp_file_path)
-            
+
             if response and len(response.strip()) > 0:
                 # Extract just the transcription from the response
                 transcription = response.strip()
-                
+
                 # Remove any assistant commentary, keep just the transcription
                 if "transcription:" in transcription.lower():
                     transcription = transcription.split(":", 1)[1].strip()
@@ -856,33 +1155,38 @@ class WhisperAudioCapture:
                     quoted = re.findall(r'"([^"]*)"', transcription)
                     if quoted:
                         transcription = quoted[0]
-                
-                self.logger.info(f"✅ Qwen2.5-Omni sync transcription: '{transcription}'")
+
+                self.logger.info(
+                    f"✅ Qwen2.5-Omni sync transcription: '{transcription}'")
                 return transcription
             else:
-                self.logger.info("🔇 Qwen2.5-Omni sync returned no transcription")
+                self.logger.info(
+                    "🔇 Qwen2.5-Omni sync returned no transcription")
                 return None
-                
+
         except Exception as e:
             self.logger.error(f"❌ Qwen2.5-Omni sync transcription error: {e}")
             return None
 
-    def _transcribe_with_llamacpp_sync(self, audio_data: np.ndarray) -> Optional[str]:
+    def _transcribe_with_llamacpp_sync(
+    self, audio_data: np.ndarray) -> Optional[str]:
         """Synchronous version of LlamaCpp Qwen transcription - DISABLED for GGUF."""
-        # LlamaCpp GGUF doesn't support audio transcription, return None to fall back to Whisper
-        self.logger.info("🎵 LlamaCpp audio transcription disabled - falling back to Whisper")
+        # LlamaCpp GGUF doesn't support audio transcription, return None to
+        # fall back to Whisper
+        self.logger.info(
+            "🎵 LlamaCpp audio transcription disabled - falling back to Whisper")
         return None
-    
+
     def start_recording(self):
         """Start recording from audio device."""
         if not VIRTUAL_AUDIO_AVAILABLE or sd is None:
             self.logger.error("❌ sounddevice not available")
             return False
-            
+
         if self.is_recording:
             self.logger.warning("⚠️  Already recording")
             return True
-        
+
         try:
             # Start audio stream
             self.stream = sd.InputStream(
@@ -893,74 +1197,84 @@ class WhisperAudioCapture:
                 dtype=self.dtype,
                 callback=self.audio_callback
             )
-            
+
             self.stream.start()
             self.is_recording = True
-            
+
             # Start processing thread
-            self.processing_thread = threading.Thread(target=self.processing_worker)
+            self.processing_thread = threading.Thread(
+                target=self.processing_worker)
             self.processing_thread.daemon = True
             self.processing_thread.start()
-            
+
             self.logger.info("✅ Whisper audio recording started")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to start recording: {e}")
             return False
-    
+
     def stop_recording(self):
         """Stop recording."""
         if not self.is_recording:
             return
-        
+
         self.is_recording = False
-        
+
         if self.stream:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        
+
         if self.processing_thread:
             self.processing_thread.join(timeout=2.0)
-        
+
         self.logger.info("🛑 Whisper audio recording stopped")
+
 
 class VoiceActivityDetector:
     """Voice Activity Detection using Silero VAD for real-time speech processing."""
-    
+
     def __init__(self, logger):
         self.logger = logger
         self.model = None
-        self.app_context: Optional[Any] = None  # Will be set later for configuration access
+        # Will be set later for configuration access
+        self.app_context: Optional[Any] = None
         self.sample_rate = 16000
         self.chunk_size = 512  # 32ms chunks at 16kHz
-        # VAD thresholds optimized for distributed Discord setup (double compression)
+        # VAD thresholds optimized for distributed Discord setup (double
+        # compression)
         self.speech_threshold = 0.15  # Very low for Discord's compressed audio
         self.silence_threshold = 0.1   # Very low for compressed audio
         self.min_speech_duration = 0.2  # Very short minimum - catch brief words
         self.max_silence_duration = 3.0  # Longer pauses for network delays
-        
+
         # State tracking
         self.is_speaking = False
         self.speech_start_time: Optional[float] = None
         self.last_speech_time: Optional[float] = None
-        self.audio_buffer = deque(maxlen=int(self.sample_rate * 10))  # 10 second buffer
-        
+        self.audio_buffer = deque(
+    maxlen=int(
+        self.sample_rate *
+         10))  # 10 second buffer
+
     async def initialize(self):
         """Initialize the VAD model."""
         try:
             # Check if VAD is disabled in configuration
             if hasattr(self, 'app_context') and self.app_context:
-                if self.app_context.global_settings.get('DISABLE_SILERO_VAD', False):
-                    self.logger.info("🔇 Silero VAD disabled in configuration, using basic audio detection")
+                if self.app_context.global_settings.get(
+                    'DISABLE_SILERO_VAD', False):
+                    self.logger.info(
+                        "🔇 Silero VAD disabled in configuration, using basic audio detection")
                     return True
                 if self.app_context.global_settings.get('DISABLE_VAD', False):
-                    self.logger.info("🔇 VAD disabled in configuration, skipping initialization")
+                    self.logger.info(
+                        "🔇 VAD disabled in configuration, skipping initialization")
                     return True
-            
+
             self.logger.info("🔧 Loading Silero VAD model...")
-            
+
             # Load Silero VAD model
             loop = asyncio.get_event_loop()
             self.model, _ = await loop.run_in_executor(
@@ -972,98 +1286,109 @@ class VoiceActivityDetector:
                     onnx=False
                 )
             )
-            
+
             self.logger.info("✅ Silero VAD model loaded successfully")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to load VAD model: {e}")
-            self.logger.info("🔇 Falling back to basic audio detection without VAD")
+            self.logger.info(
+                "🔇 Falling back to basic audio detection without VAD")
             return True  # Return True to continue without VAD
-    
+
     def process_audio_chunk(self, audio_data: bytes) -> tuple[bool, bool]:
         """
         Process audio chunk and return (is_speech, speech_ended).
-        
+
         Returns:
             is_speech: True if current chunk contains speech
             speech_ended: True if a complete speech segment just ended
         """
         if not self.model:
             return False, False
-            
+
         try:
             # Convert bytes to numpy array
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            
+            audio_np = np.frombuffer(
+    audio_data,
+    dtype=np.int16).astype(
+        np.float32) / 32768.0
+
             # Resample if needed (Discord uses 48kHz, VAD expects 16kHz)
             if len(audio_np) > 0:
                 # Simple downsampling (Discord 48kHz -> VAD 16kHz)
                 audio_np = audio_np[::3]  # Take every 3rd sample
-                
+
                 # Ensure we have enough samples
                 if len(audio_np) < self.chunk_size:
                     # Pad with zeros if too short
-                    audio_np = np.pad(audio_np, (0, self.chunk_size - len(audio_np)))
+                    audio_np = np.pad(
+    audio_np, (0, self.chunk_size - len(audio_np)))
                 elif len(audio_np) > self.chunk_size:
                     # Truncate if too long
                     audio_np = audio_np[:self.chunk_size]
-                
+
                 # Add to buffer
                 self.audio_buffer.extend(audio_np)
-                
+
                 # Convert to tensor
                 audio_tensor = torch.from_numpy(audio_np).float()
-                
+
                 # Get VAD probability
                 speech_prob = self.model(audio_tensor, self.sample_rate).item()
-                
+
                 current_time = time.time()
-                
-                # For distributed Discord setup: if volume is good, override VAD
-                audio_max = np.max(np.abs(audio_np)) if len(audio_np) > 0 else 0.0
+
+                # For distributed Discord setup: if volume is good, override
+                # VAD
+                audio_max = np.max(
+    np.abs(audio_np)) if len(audio_np) > 0 else 0.0
                 volume_override = audio_max > 0.3  # Good volume suggests speech
-                
+
                 is_speech = speech_prob > self.speech_threshold or volume_override
                 speech_ended = False
-                
+
                 if volume_override and speech_prob <= self.speech_threshold:
-                    self.logger.info(f"🎯 Volume override: treating as speech (vol: {audio_max:.3f}, prob: {speech_prob:.3f})")
-                
+                    self.logger.info(
+                        f"🎯 Volume override: treating as speech (vol: {audio_max:.3f}, prob: {speech_prob:.3f})")
+
                 if is_speech:
                     if not self.is_speaking:
                         # Speech started
                         self.is_speaking = True
                         self.speech_start_time = current_time
-                        self.logger.info(f"🎤 Speech started (prob: {speech_prob:.3f})")
-                    
+                        self.logger.info(
+                            f"🎤 Speech started (prob: {speech_prob:.3f})")
+
                     self.last_speech_time = current_time
-                    
+
                 elif self.is_speaking and self.last_speech_time is not None:
                     # Check if silence duration exceeds threshold
                     silence_duration = current_time - self.last_speech_time
-                    
+
                     if silence_duration > self.max_silence_duration and self.speech_start_time is not None:
                         # Speech ended
                         speech_duration = current_time - self.speech_start_time
-                        
+
                         if speech_duration >= self.min_speech_duration:
                             speech_ended = True
-                            self.logger.info(f"🎤 Speech ended (duration: {speech_duration:.2f}s, silence: {silence_duration:.2f}s)")
+                            self.logger.info(
+                                f"🎤 Speech ended (duration: {speech_duration:.2f}s, silence: {silence_duration:.2f}s)")
                         else:
-                            self.logger.info(f"🔇 Speech too short (duration: {speech_duration:.2f}s < {self.min_speech_duration:.2f}s)")
-                        
+                            self.logger.info(
+                                f"🔇 Speech too short (duration: {speech_duration:.2f}s < {self.min_speech_duration:.2f}s)")
+
                         self.is_speaking = False
                         self.speech_start_time = None
                         self.last_speech_time = None
-                
+
                 return is_speech, speech_ended
-                
+
         except Exception as e:
             self.logger.error(f"❌ VAD processing error: {e}")
-            
+
         return False, False
-    
+
     def get_speech_audio(self) -> Optional[np.ndarray]:
         """Get the accumulated speech audio from buffer."""
         if len(self.audio_buffer) > 0:
@@ -1072,9 +1397,10 @@ class VoiceActivityDetector:
             return audio_array
         return None
 
+
 class DanzarVoiceBot(commands.Bot):
     """Enhanced Discord bot with Voice Activity Detection for natural conversation."""
-    
+
     def __init__(self, settings: dict, app_context: AppContext):
         # Initialize loop attribute for async operations
         self.loop = None
@@ -1083,17 +1409,17 @@ class DanzarVoiceBot(commands.Bot):
         intents.message_content = True
         intents.voice_states = True
         intents.guilds = True
-        
+
         super().__init__(
             command_prefix="!",
             intents=intents,
             help_command=None
         )
-        
+
         self.settings = settings
         self.app_context = app_context
         self.logger = app_context.logger
-        
+
         # Voice processing components
         self.whisper_model = None
         self.vad_model = None
@@ -1101,38 +1427,38 @@ class DanzarVoiceBot(commands.Bot):
         self.simple_voice_receiver: Optional[SimpleVoiceReceiver] = None
         self.vad_voice_receiver: Optional[Any] = None
         self.offline_vad_voice_receiver = None  # Type will be set when available
-        
+
         # Service references
         self.tts_service = None
         self.llm_service = None
-        
-        
+
         # Voice connection tracking
         self.connections: Dict[int, discord.VoiceClient] = {}
         self.recording_tasks: Dict[int, asyncio.Task] = {}
-        
+
         # VAD-based voice receiver
         self.vad_voice_receiver: Optional[VADVoiceReceiver] = None
-        
+
         # Initialize VAD detector
         self.vad = VoiceActivityDetector(self.logger)
-        self.vad.app_context = self.app_context  # Pass app_context for configuration access
-        
+        # Pass app_context for configuration access
+        self.vad.app_context = self.app_context
+
         # Virtual audio capture
         self.virtual_audio: Optional[WhisperAudioCapture] = None
         self.use_virtual_audio = settings.get('USE_VIRTUAL_AUDIO', False)
-        
+
         # ===== AUDIO FEEDBACK PREVENTION SYSTEM =====
         self.feedback_prevention = AudioFeedbackPrevention(self.logger)
-        
+
         # ===== TTS QUEUE SYSTEM FOR ORDERED PLAYBACK =====
         self.tts_queue = asyncio.Queue()
         self.tts_queue_active = False
         self.tts_queue_task = None
-        
+
         # LLM search mode setting
         self.llm_search_mode = False
-        
+
         # Add commands
         self.add_commands()
 
@@ -1142,167 +1468,265 @@ class DanzarVoiceBot(commands.Bot):
             # Load environment variables for TTS configuration
             from dotenv import load_dotenv
             load_dotenv()
-            
+
             # Initialize Azure TTS Service (replaces Chatterbox TTS)
             try:
                 from services.tts_service_azure import AzureTTSService
-                
+
                 # Check if Azure TTS is configured in environment variables
                 azure_tts_key = os.environ.get('AZURE_TTS_SUBSCRIPTION_KEY')
                 if not azure_tts_key:
-                    self.logger.warning("⚠️ Azure TTS subscription key not configured in environment")
-                    self.logger.info("🔄 Falling back to default TTS service...")
+                    self.logger.warning(
+                        "⚠️ Azure TTS subscription key not configured in environment")
+                    self.logger.info(
+                        "🔄 Falling back to default TTS service...")
                     from services.tts_service import TTSService
                     self.tts_service = TTSService(self.app_context)
                 else:
                     # Update global settings with environment variables
                     self.app_context.global_settings['AZURE_TTS_SUBSCRIPTION_KEY'] = azure_tts_key
-                    self.app_context.global_settings['AZURE_TTS_REGION'] = os.environ.get('AZURE_TTS_REGION', 'eastus')
-                    self.app_context.global_settings['AZURE_TTS_VOICE'] = os.environ.get('AZURE_TTS_VOICE', 'en-US-AdamMultilingualNeural')
-                    self.app_context.global_settings['AZURE_TTS_SPEECH_RATE'] = os.environ.get('AZURE_TTS_SPEECH_RATE', '+0%')
-                    self.app_context.global_settings['AZURE_TTS_PITCH'] = os.environ.get('AZURE_TTS_PITCH', '+0%')
-                    self.app_context.global_settings['AZURE_TTS_VOLUME'] = os.environ.get('AZURE_TTS_VOLUME', '+0%')
-                    
+                    self.app_context.global_settings['AZURE_TTS_REGION'] = os.environ.get(
+                        'AZURE_TTS_REGION', 'eastus')
+                    self.app_context.global_settings['AZURE_TTS_VOICE'] = os.environ.get(
+                        'AZURE_TTS_VOICE', 'en-US-AdamMultilingualNeural')
+                    self.app_context.global_settings['AZURE_TTS_SPEECH_RATE'] = os.environ.get(
+                        'AZURE_TTS_SPEECH_RATE', '+0%')
+                    self.app_context.global_settings['AZURE_TTS_PITCH'] = os.environ.get(
+                        'AZURE_TTS_PITCH', '+0%')
+                    self.app_context.global_settings['AZURE_TTS_VOLUME'] = os.environ.get(
+                        'AZURE_TTS_VOLUME', '+0%')
+
                     self.tts_service = AzureTTSService(self.app_context)
                     if await self.tts_service.initialize():
-                        self.logger.info("✅ Azure TTS Service initialized successfully")
-                        self.logger.info(f"🎤 Voice: {self.tts_service.voice_name}")
-                        self.logger.info(f"🌍 Region: {self.tts_service.region}")
+                        self.logger.info(
+                            "✅ Azure TTS Service initialized successfully")
+                        self.logger.info(
+                            f"🎤 Voice: {self.tts_service.voice_name}")
+                        self.logger.info(
+                            f"🌍 Region: {self.tts_service.region}")
                     else:
-                        self.logger.error("❌ Azure TTS Service initialization failed")
-                        self.logger.info("🔄 Falling back to default TTS service...")
+                        self.logger.error(
+                            "❌ Azure TTS Service initialization failed")
+                        self.logger.info(
+                            "🔄 Falling back to default TTS service...")
                         from services.tts_service import TTSService
                         self.tts_service = TTSService(self.app_context)
-                        
+
             except Exception as e:
-                self.logger.error(f"❌ Failed to initialize Azure TTS Service: {e}")
+                self.logger.error(
+                    f"❌ Failed to initialize Azure TTS Service: {e}")
                 self.logger.info("🔄 Falling back to default TTS service...")
                 from services.tts_service import TTSService
                 self.tts_service = TTSService(self.app_context)
-            
+
             self.app_context.tts_service = self.tts_service
             self.logger.info("✅ TTS Service initialized")
-            
+
             # Initialize Memory Service
             memory_service = MemoryService(self.app_context)
-            # Note: MemoryService doesn't have initialize method, it's ready after construction
+            # Note: MemoryService doesn't have initialize method, it's ready
+            # after construction
             self.app_context.memory_service = memory_service
             self.logger.info("✅ Memory Service initialized")
-            
-            # Initialize Qwen2.5-VL Integration Service (Primary VLM for OBS + Discord)
+
+            # Initialize Hybrid Memory Manager (STM + LTM)
+            try:
+                self.app_context.memory_manager = MemoryManager(
+                    app_context=self.app_context,
+                    config_path="config/memory_config.yaml"
+                )
+                # Initialize the memory manager
+                if await self.app_context.memory_manager.initialize():
+                    self.logger.info(
+                        "✅ Enhanced Memory-Augmented RAG Manager initialized")
+                    self.logger.info(
+                        "🧠 STM: In-RAM buffer for recent conversation turns")
+                    self.logger.info(
+                        "💾 LTM: Qdrant-based persistent storage with LLM summarization")
+                    self.logger.info(
+                        "🔄 Cross-session memory retrieval and consolidation enabled")
+                else:
+                    self.logger.error("❌ Memory Manager initialization failed")
+                    self.app_context.memory_manager = None
+            except Exception as e:
+                self.logger.error(
+                    f"❌ Memory Manager initialization failed: {e}")
+                self.app_context.memory_manager = None
+
+            # Initialize GPU Memory Manager for coordinating GPU usage
+            try:
+                from services.gpu_memory_manager import GPUMemoryManager
+                self.app_context.gpu_memory_manager = GPUMemoryManager(
+                    self.app_context)
+                self.app_context.gpu_memory_manager.start_memory_monitoring()
+                self.logger.info("✅ GPU Memory Manager initialized")
+                self.logger.info(
+                    "🎯 Main LLM: cuda:0 (4070) - reserved for LLM operations")
+                self.logger.info(
+                    "🎯 Vision Processing: cuda:1 (4070 Super) - for vision models")
+                self.logger.info("📊 GPU memory monitoring active")
+            except Exception as e:
+                self.logger.error(
+                    f"❌ GPU Memory Manager initialization failed: {e}")
+                self.app_context.gpu_memory_manager = None
+
+            # Initialize Qwen2.5-VL Integration Service (Primary VLM for OBS +
+            # Discord)
             try:
                 from services.qwen_vl_integration_service import QwenVLIntegrationService
-                self.app_context.qwen_vl_integration = QwenVLIntegrationService(self.app_context)
+                self.app_context.qwen_vl_integration = QwenVLIntegrationService(
+                    self.app_context)
                 if await self.app_context.qwen_vl_integration.initialize():
-                    self.logger.info("✅ Qwen2.5-VL Integration Service initialized")
-                    self.logger.info("🎯 Primary VLM: CUDA-enabled Qwen2.5-VL for OBS vision + Discord")
-                    
+                    self.logger.info(
+                        "✅ Qwen2.5-VL Integration Service initialized")
+                    self.logger.info(
+                        "🎯 Primary VLM: CUDA-enabled Qwen2.5-VL for OBS vision + Discord")
+
                     # Get performance stats
                     stats = self.app_context.qwen_vl_integration.get_performance_stats()
-                    self.logger.info(f"📊 Qwen2.5-VL Stats: CUDA: {stats['cuda_available']}, Fallback: {stats['transformers_fallback']}")
+                    self.logger.info(
+                        f"📊 Qwen2.5-VL Stats: CUDA: {stats['cuda_available']}, Fallback: {stats['transformers_fallback']}")
                 else:
-                    self.logger.error("❌ Qwen2.5-VL Integration Service initialization failed")
+                    self.logger.error(
+                        "❌ Qwen2.5-VL Integration Service initialization failed")
                     self.app_context.qwen_vl_integration = None
             except Exception as e:
-                self.logger.error(f"❌ Qwen2.5-VL Integration Service error: {e}")
+                self.logger.error(
+                    f"❌ Qwen2.5-VL Integration Service error: {e}")
                 self.app_context.qwen_vl_integration = None
-            
+
             # Initialize Real-Time Voice Service (Neuro-sama style)
-            realtime_voice_config = self.app_context.global_settings.get('REAL_TIME_VOICE', {})
+            realtime_voice_config = self.app_context.global_settings.get(
+                'REAL_TIME_VOICE', {})
             if realtime_voice_config.get('enabled', False):
                 try:
                     from services.real_time_voice_service import RealTimeVoiceService
-                    self.app_context.realtime_voice_service = RealTimeVoiceService(self.app_context)
+                    self.app_context.realtime_voice_service = RealTimeVoiceService(
+                        self.app_context)
                     if await self.app_context.realtime_voice_service.initialize():
-                        self.logger.info("✅ Real-Time Voice Service initialized")
-                        
+                        self.logger.info(
+                            "✅ Real-Time Voice Service initialized")
+
                         # Set up callbacks
-                        self.app_context.realtime_voice_service.set_transcription_callback(self._on_realtime_transcription)
-                        self.app_context.realtime_voice_service.set_response_callback(self._on_realtime_response)
+                        self.app_context.realtime_voice_service.set_transcription_callback(
+                            self._on_realtime_transcription)
+                        self.app_context.realtime_voice_service.set_response_callback(
+                            self._on_realtime_response)
                     else:
-                        self.logger.error("❌ Real-Time Voice Service initialization failed")
+                        self.logger.error(
+                            "❌ Real-Time Voice Service initialization failed")
                         self.app_context.realtime_voice_service = None
                 except Exception as e:
-                    self.logger.error(f"❌ Failed to initialize Real-Time Voice Service: {e}")
+                    self.logger.error(
+                        f"❌ Failed to initialize Real-Time Voice Service: {e}")
                     self.app_context.realtime_voice_service = None
             else:
                 self.app_context.realtime_voice_service = None
-                self.logger.info("ℹ️ Real-Time Voice Service disabled in configuration")
-            
+                self.logger.info(
+                    "ℹ️ Real-Time Voice Service disabled in configuration")
+
             # Initialize Qwen2.5-Omni Service if enabled
-            qwen_omni_config = self.app_context.global_settings.get('QWEN_OMNI_SERVICE', {})
+            qwen_omni_config = self.app_context.global_settings.get(
+                'QWEN_OMNI_SERVICE', {})
             if qwen_omni_config.get('enabled', False):
                 try:
                     from services.qwen_omni_service import QwenOmniService
-                    self.app_context.qwen_omni_service = QwenOmniService(self.app_context)
+                    self.app_context.qwen_omni_service = QwenOmniService(
+                        self.app_context)
                     if await self.app_context.qwen_omni_service.initialize():
                         self.logger.info("✅ Qwen2.5-Omni Service initialized")
                         # Use Qwen2.5-Omni as the primary model client
                         model_client = self.app_context.qwen_omni_service
                     else:
-                        self.logger.error("❌ Qwen2.5-Omni Service initialization failed")
-                        model_client = ModelClient(app_context=self.app_context)
+                        self.logger.error(
+                            "❌ Qwen2.5-Omni Service initialization failed")
+                        model_client = ModelClient(
+                            app_context=self.app_context)
                 except Exception as e:
                     self.logger.error(f"❌ Qwen2.5-Omni Service error: {e}")
                     model_client = ModelClient(app_context=self.app_context)
             else:
                 # Initialize LlamaCpp Qwen Service if enabled
-                llamacpp_config = self.app_context.global_settings.get('LLAMACPP_QWEN', {})
+                llamacpp_config = self.app_context.global_settings.get(
+                    'LLAMACPP_QWEN', {})
                 if llamacpp_config.get('enabled', False):
                     try:
                         from services.llamacpp_qwen_service import LlamaCppQwenService
-                        self.app_context.llamacpp_qwen_service = LlamaCppQwenService(self.app_context)
+                        self.app_context.llamacpp_qwen_service = LlamaCppQwenService(
+                            self.app_context)
                         if await self.app_context.llamacpp_qwen_service.initialize():
-                            self.logger.info("✅ LlamaCpp Qwen Service initialized")
+                            self.logger.info(
+                                "✅ LlamaCpp Qwen Service initialized")
                             # Use LlamaCpp Qwen as the primary model client
                             model_client = self.app_context.llamacpp_qwen_service
                         else:
-                            self.logger.error("❌ LlamaCpp Qwen Service initialization failed")
-                            model_client = ModelClient(app_context=self.app_context)
+                            self.logger.error(
+                                "❌ LlamaCpp Qwen Service initialization failed")
+                            model_client = ModelClient(
+                                app_context=self.app_context)
                     except Exception as e:
-                        self.logger.error(f"❌ LlamaCpp Qwen Service error: {e}")
-                        model_client = ModelClient(app_context=self.app_context)
+                        self.logger.error(
+                            f"❌ LlamaCpp Qwen Service error: {e}")
+                        model_client = ModelClient(
+                            app_context=self.app_context)
                 else:
                     # Initialize Model Client with proper parameters
                     model_client = ModelClient(app_context=self.app_context)
                     self.logger.info("✅ Standard Model Client initialized")
-            
+
             # Set model client in both places for compatibility
             self.app_context.model_client = model_client
             self.model_client = model_client  # This fixes the streaming service
             self.logger.info("✅ Model Client initialized")
-            
+
+            # Verify model client is properly set
+            if hasattr(
+    self.app_context,
+     'model_client') and self.app_context.model_client:
+                self.logger.info(
+                    f"✅ Model client verified: {type(self.app_context.model_client)}")
+                self.logger.info(
+                    "🎯 Model client ready for vision integration and commentary generation")
+            else:
+                self.logger.error(
+                    "❌ Model client verification failed - vision commentary will not work")
+
             # Initialize RAG Service (Qdrant connection)
             try:
                 from services.llamacpp_rag_service import LlamaCppRAGService
-                rag_service = LlamaCppRAGService(self.app_context.global_settings)
+                rag_service = LlamaCppRAGService(
+                    self.app_context.global_settings)
                 self.app_context.rag_service_instance = rag_service
-                self.logger.info("✅ Llama.cpp + Qdrant RAG Service initialized")
+                self.logger.info(
+                    "✅ Llama.cpp + Qdrant RAG Service initialized")
             except Exception as e:
                 self.logger.error(f"❌ RAG Service initialization failed: {e}")
                 rag_service = None
-            
+
             # Initialize faster-whisper STT Service with maximum accuracy
             self.app_context.faster_whisper_stt_service = WhisperSTTService(
-                self.app_context, 
+                self.app_context,
                 model_size="medium"  # Changed from 'large' to 'medium' for better performance
-                # Removed device parameter as it's not supported by WhisperSTTService
+                # Removed device parameter as it's not supported by
+                # WhisperSTTService
             )
             if await self.app_context.faster_whisper_stt_service.initialize():
                 self.logger.info("✅ faster-whisper STT Service initialized")
             else:
-                self.logger.error("❌ faster-whisper STT Service initialization failed")
-            
+                self.logger.error(
+                    "❌ faster-whisper STT Service initialization failed")
+
             # Initialize Simple Voice Receiver for Discord voice capture
             self.app_context.simple_voice_receiver = SimpleVoiceReceiver(
-                self.app_context, 
+                self.app_context,
                 speech_callback=self.process_simple_discord_audio
             )
             if self.app_context.simple_voice_receiver.initialize():
                 self.logger.info("✅ Simple Voice Receiver initialized")
             else:
-                self.logger.error("❌ Simple Voice Receiver initialization failed")
-            
+                self.logger.error(
+                    "❌ Simple Voice Receiver initialization failed")
+
             # Initialize VAD Voice Receiver (improved version)
             if VAD_VOICE_AVAILABLE and VADVoiceReceiver:
                 try:
@@ -1313,14 +1737,16 @@ class DanzarVoiceBot(commands.Bot):
                     if await self.app_context.vad_voice_receiver.initialize():
                         self.logger.info("✅ VAD Voice Receiver initialized")
                     else:
-                        self.logger.error("❌ VAD Voice Receiver initialization failed")
+                        self.logger.error(
+                            "❌ VAD Voice Receiver initialization failed")
                 except Exception as e:
                     self.logger.error(f"❌ VAD Voice Receiver error: {e}")
                     self.app_context.vad_voice_receiver = None
             else:
-                self.logger.info("ℹ️ VAD Voice Receiver not available (missing dependencies)")
+                self.logger.info(
+                    "ℹ️ VAD Voice Receiver not available (missing dependencies)")
                 self.app_context.vad_voice_receiver = None
-            
+
             # Initialize Offline VAD Voice Receiver (100% local processing)
             if OFFLINE_VOICE_AVAILABLE and OfflineVADVoiceReceiver:
                 self.app_context.offline_vad_voice_receiver = OfflineVADVoiceReceiver(
@@ -1328,12 +1754,15 @@ class DanzarVoiceBot(commands.Bot):
                     speech_callback=self.process_offline_voice_response
                 )
                 if await self.app_context.offline_vad_voice_receiver.initialize():
-                    self.logger.info("✅ Offline VAD Voice Receiver initialized (100% local)")
+                    self.logger.info(
+                        "✅ Offline VAD Voice Receiver initialized (100% local)")
                 else:
-                    self.logger.error("❌ Offline VAD Voice Receiver initialization failed")
+                    self.logger.error(
+                        "❌ Offline VAD Voice Receiver initialization failed")
             else:
-                self.logger.info("ℹ️ Offline voice receiver not available (missing dependencies)")
-            
+                self.logger.info(
+                    "ℹ️ Offline voice receiver not available (missing dependencies)")
+
             # Initialize Streaming LLM Service for real-time responses
             try:
                 from services.streaming_llm_service import StreamingLLMService
@@ -1346,22 +1775,27 @@ class DanzarVoiceBot(commands.Bot):
                 self.app_context.streaming_llm_service = self.streaming_llm_service
                 self.logger.info("✅ Streaming LLM Service initialized")
             except Exception as e:
-                self.logger.error(f"❌ Streaming LLM Service initialization failed: {e}")
+                self.logger.error(
+                    f"❌ Streaming LLM Service initialization failed: {e}")
                 # Fallback to regular LLM service
                 self.streaming_llm_service = None
-            
+
             # Initialize regular LLM Service as fallback
-            self.llm_service = LLMService(
-                app_context=self.app_context,
-                audio_service=None,  # Not needed for voice bot
-                rag_service=rag_service,    # Use the initialized RAG service
-                model_client=model_client
+            self.llm_service = EnhancedLLMService(
+                app_context=self.app_context
             )
-            # Note: LLMService doesn't have initialize method, it's ready after construction
+            # Initialize the enhanced LLM service
+            if await self.llm_service.initialize():
+                self.logger.info(
+                    "✅ Enhanced LLM Service initialized with STT correction and fact checking")
+            else:
+                self.logger.error(
+                    "❌ Enhanced LLM Service initialization failed")
+                self.llm_service = None
             self.app_context.llm_service = self.llm_service
-            self.logger.info("✅ LLM Service initialized")
-            
-            # Initialize Real-Time Streaming LLM Service for immediate voice responses
+
+            # Initialize Real-Time Streaming LLM Service for immediate voice
+            # responses
             try:
                 from services.real_time_streaming_llm import RealTimeStreamingLLMService
                 self.real_time_streaming_service = RealTimeStreamingLLMService(
@@ -1370,56 +1804,169 @@ class DanzarVoiceBot(commands.Bot):
                     tts_service=self.tts_service
                 )
                 if await self.real_time_streaming_service.initialize():
-                    self.logger.info("✅ Real-Time Streaming LLM Service initialized")
-                    self.logger.info("🎵 Voice responses will stream in real-time")
+                    self.logger.info(
+                        "✅ Real-Time Streaming LLM Service initialized")
+                    self.logger.info(
+                        "🎵 Voice responses will stream in real-time")
                 else:
-                    self.logger.error("❌ Real-Time Streaming LLM Service initialization failed")
+                    self.logger.error(
+                        "❌ Real-Time Streaming LLM Service initialization failed")
                     self.real_time_streaming_service = None
             except Exception as e:
-                self.logger.error(f"❌ Real-Time Streaming LLM Service error: {e}")
+                self.logger.error(
+                    f"❌ Real-Time Streaming LLM Service error: {e}")
                 self.real_time_streaming_service = None
-            
+
             # Initialize Short-Term Memory Service
-            self.app_context.short_term_memory_service = ShortTermMemoryService(self.app_context)
+            self.app_context.short_term_memory_service = ShortTermMemoryService(
+                self.app_context)
+            self.app_context.short_term_memory_service.start_cleanup_thread()
             self.logger.info("✅ Short-Term Memory Service initialized")
-            
-            # Initialize Hybrid Vision Service (replaces MiniGPT-4 Video Service)
+            self.logger.info("🧠 STM cleanup thread started")
+
+            # Initialize Qwen Vision Service (replaces Hybrid Vision Service)
             try:
-                from services.hybrid_vision_service import HybridVisionService
-                self.app_context.hybrid_vision_service = HybridVisionService(self.app_context)
-                if await self.app_context.hybrid_vision_service.initialize():
-                    self.logger.info("✅ Hybrid Vision Service initialized")
-                    self.logger.info("✅ Using Phi-4 for fast video analysis")
-                    
+                from services.qwen_vision_service import QwenVisionService
+                self.app_context.qwen_vision_service = QwenVisionService(
+                    self.app_context)
+                if await self.app_context.qwen_vision_service.initialize():
+                    self.logger.info("✅ Qwen Vision Service initialized")
+                    self.logger.info("✅ Using Qwen2.5-VL for video analysis")
+
                     # Get service status
-                    status = self.app_context.hybrid_vision_service.get_status()
-                    self.logger.info(f"📊 Hybrid Service Status: Phi-4: {status['phi4_available']}")
+                    status = self.app_context.qwen_vision_service.get_status()
+                    self.logger.info(
+                        f"📊 Qwen Vision Service Status: Available: {status['qwen_available']}")
                 else:
-                    self.logger.error("❌ Hybrid Vision Service initialization failed")
-                    self.app_context.hybrid_vision_service = None
+                    self.logger.error(
+                        "❌ Qwen Vision Service initialization failed")
+                    self.app_context.qwen_vision_service = None
             except ImportError:
-                self.logger.warning("ℹ️ Hybrid Vision Service not available - falling back to basic video analysis")
-                self.app_context.hybrid_vision_service = None
+                self.logger.warning(
+                    "ℹ️ Qwen Vision Service not available - falling back to basic video analysis")
+                self.app_context.qwen_vision_service = None
             except Exception as e:
-                self.logger.error(f"❌ Hybrid Vision Service error: {e}")
-                self.app_context.hybrid_vision_service = None
-            
-            # Initialize Conversational AI Service for turn-taking and game awareness
+                self.logger.error(f"❌ Qwen Vision Service error: {e}")
+                self.app_context.qwen_vision_service = None
+
+            # Initialize Vision-Aware Conversation Service with Enhanced Memory
             try:
-                from services.conversational_ai_service import ConversationalAIService
-                self.app_context.conversational_ai_service = ConversationalAIService(self.app_context)
+                self.app_context.conversational_ai_service = VisionAwareConversationService(
+                    self.app_context)
                 if await self.app_context.conversational_ai_service.initialize():
-                    self.logger.info("✅ Conversational AI Service initialized")
-                    self.logger.info("🎯 Features: Turn-taking, game awareness, BLIP/CLIP integration")
+                    self.logger.info(
+                        "✅ Vision-Aware Conversation Service initialized")
+                    self.logger.info(
+                        "🧠 Features: Enhanced STM+LTM memory, visual context, turn-taking")
+                    self.logger.info(
+                        "👁️ Vision-aware responses with CLIP integration")
                 else:
-                    self.logger.error("❌ Conversational AI Service initialization failed")
+                    self.logger.error(
+                        "❌ Vision-Aware Conversation Service initialization failed")
                     self.app_context.conversational_ai_service = None
             except Exception as e:
-                self.logger.error(f"❌ Conversational AI Service error: {e}")
+                self.logger.error(
+                    f"❌ Vision-Aware Conversation Service error: {e}")
                 self.app_context.conversational_ai_service = None
-            
+
+            # Store bot reference in app context for services to access Discord
+            # methods
+            self.app_context.bot = self
+            self.logger.info(
+                "✅ Bot reference stored in app context for service access")
+
+            # Initialize Vision Integration Service for !watch and !stopwatch
+            # commands
+            try:
+                from services.vision_integration_service import VisionIntegrationService
+
+                # Verify model client is available before initializing vision
+                # integration
+                if hasattr(
+    self.app_context,
+     'model_client') and self.app_context.model_client:
+                    self.logger.info(
+                        "✅ Model client available for vision integration")
+                    self.logger.info(
+                        f"📊 Model client type: {type(self.app_context.model_client)}")
+                else:
+                    self.logger.error(
+                        "❌ Model client not available - vision commentary will not work")
+                    self.logger.error(
+                        "🔧 Please check model client initialization above")
+
+                self.app_context.vision_integration_service = VisionIntegrationService(
+                    self.app_context)
+                if await self.app_context.vision_integration_service.initialize():
+                    self.logger.info(
+                        "✅ Vision Integration Service initialized with auto-start commentary")
+                    self.logger.info(
+                        "👁️ Vision events will automatically generate commentary")
+                    self.logger.info(
+                        "🎯 YOLO, OCR, CLIP, and screenshots will be processed")
+
+                    # Verify the service has access to model client
+                    if hasattr(self.app_context.vision_integration_service, 'app_context') and \
+                       hasattr(self.app_context.vision_integration_service.app_context, 'model_client') and \
+                       self.app_context.vision_integration_service.app_context.model_client:
+                        self.logger.info(
+                            "✅ Vision Integration Service has access to model client")
+                    else:
+                        self.logger.warning(
+                            "⚠️ Vision Integration Service may not have access to model client")
+                else:
+                    self.logger.error(
+                        "❌ Vision Integration Service initialization failed")
+                    self.app_context.vision_integration_service = None
+            except Exception as e:
+                self.logger.error(f"❌ Vision Integration Service error: {e}")
+
+            # Initialize LangChain Tools Service for agentic behavior
+            try:
+                from services.langchain_tools_service import DanzarLangChainTools
+                self.logger.info("🔧 Initializing LangChain Tools Service...")
+                self.app_context.langchain_tools = DanzarLangChainTools(self.app_context)
+                # Initialize the agent with the model client
+                if hasattr(self.app_context, 'model_client') and self.app_context.model_client:
+                    success = await self.app_context.langchain_tools.initialize_agent(self.app_context.model_client)
+                    if success:
+                        self.logger.info("✅ LangChain Tools Service initialized successfully")
+                        self.logger.info("🤖 Agentic behavior enabled with tool awareness")
+                        self.logger.info("🎯 LLM can now use vision, memory, and system tools")
+                    else:
+                        self.logger.error("❌ LangChain agent initialization failed")
+                        self.app_context.langchain_tools = None
+                else:
+                    self.logger.error("❌ Model client not available for LangChain tools")
+                    self.app_context.langchain_tools = None
+            except Exception as e:
+                self.logger.error(f"❌ LangChain Tools Service error: {e}")
+                self.app_context.langchain_tools = None
+
         except Exception as e:
-            self.logger.error(f"❌ Service initialization failed: {e}")
+            self.logger.error(f"❌ Service initialization error: {e}")
+            self.logger.error("🔧 Some services may not be available")
+
+    async def _on_realtime_transcription(self, transcription: str):
+        """Callback for real-time voice transcription."""
+        try:
+            self.logger.info(f"[RealtimeVoice] Transcription: {transcription}")
+            # Process transcription through the normal pipeline
+            await self._process_transcription(transcription, "RealtimeUser")
+        except Exception as e:
+            self.logger.error(f"[RealtimeVoice] Transcription callback error: {e}")
+    
+    async def _on_realtime_response(self, response: str):
+        """Callback for real-time voice response."""
+        try:
+            self.logger.info(f"[RealtimeVoice] Response: {response}")
+            # Send response through TTS
+            if hasattr(self, 'tts_service') and self.tts_service:
+                tts_audio = await self.tts_service.synthesize_speech(response)
+                if tts_audio:
+                    await self._play_tts_audio_with_feedback_prevention(tts_audio)
+        except Exception as e:
+            self.logger.error(f"[RealtimeVoice] Response callback error: {e}")
 
     def add_commands(self):
         """Add Discord commands."""
@@ -1622,15 +2169,104 @@ class DanzarVoiceBot(commands.Bot):
                 else:
                     status_msg += "🔇 Not connected to voice\n"
             
-            status_msg += f"🧠 Whisper Model: **{'Loaded' if self.whisper_model else 'Not Loaded'}**\n"
-            status_msg += f"🎯 faster-whisper STT: **{'Ready' if hasattr(self.app_context, 'faster_whisper_stt_service') and self.app_context.faster_whisper_stt_service else 'Not Ready'}**\n"
-            status_msg += f"🎯 VAD Model: **{'Loaded' if hasattr(self.vad, 'model') and self.vad.model else 'Not Loaded'}**\n"
-            status_msg += f"🤖 LLM Service: **{'Ready' if self.llm_service else 'Not Ready'}**\n"
-            status_msg += f"🔊 TTS Service: **{'Ready' if self.tts_service else 'Not Ready'}**\n"
-            status_msg += f"🎯 Guilds: **{len(self.guilds)}**\n"
-            status_msg += f"🎵 Virtual Audio Available: **{'Yes' if VIRTUAL_AUDIO_AVAILABLE else 'No'}**\n"
+            # Add vision status
+            if hasattr(self.app_context, 'vision_integration_service') and self.app_context.vision_integration_service:
+                vision_status = getattr(self.app_context.vision_integration_service, 'is_watching', False)
+                status_msg += f"👁️ Vision Commentary: **{'Active' if vision_status else 'Inactive'}**\n"
+            else:
+                status_msg += "👁️ Vision Commentary: **Not Available**\n"
+            
+            # Add LLM status
+            if hasattr(self.app_context, 'model_client') and self.app_context.model_client:
+                status_msg += "🧠 LLM Service: **Available**\n"
+            else:
+                status_msg += "🧠 LLM Service: **Not Available**\n"
+            
+            # Add TTS status
+            if hasattr(self.app_context, 'tts_service') and self.app_context.tts_service:
+                status_msg += "🔊 TTS Service: **Available**\n"
+            else:
+                status_msg += "🔊 TTS Service: **Not Available**\n"
             
             await ctx.send(status_msg)
+
+        @self.command(name='danzar')
+        async def danzar_command(ctx, *, message: str = None):
+            """Talk to DanzarAI in text chat (no TTS)."""
+            self.logger.info(f"💬 !danzar used by {ctx.author.name}: {message}")
+            
+            if not message:
+                await ctx.send("💬 **DanzarAI Text Chat**\n"
+                             "Use `!danzar <your message>` to talk to me in text!\n"
+                             "I'll respond with text only - no voice synthesis.\n\n"
+                             "**Examples:**\n"
+                             "• `!danzar Hello, how are you?`\n"
+                             "• `!danzar Tell me about artificial intelligence`\n"
+                             "• `!danzar What's the weather like?`\n"
+                             "• `!danzar Help me with Python programming`")
+                return
+            
+            try:
+                # Show typing indicator
+                async with ctx.typing():
+                    # Get user name
+                    user_name = ctx.author.display_name
+                    
+                    # Check if we have an LLM service available
+                    if not hasattr(self.app_context, 'model_client') or not self.app_context.model_client:
+                        await ctx.send("❌ **LLM Service Not Available**\n"
+                                     "The language model service is not currently available. "
+                                     "Please check the bot status with `!status`.")
+                        return
+                    
+                    # Create a text-only callback (no TTS)
+                    async def text_only_callback(response_text: str):
+                        """Send response as text only, no TTS."""
+                        if response_text and response_text.strip():
+                            # Clean up the response for Discord
+                            clean_response = self._strip_markdown_for_tts(response_text)
+                            clean_response = self._strip_think_tags(clean_response)
+                            
+                            # Send the response
+                            await ctx.send(f"🤖 **DanzarAI:** {clean_response}")
+                    
+                    # Process the message using the LLM service
+                    if hasattr(self.app_context, 'enhanced_llm_service') and self.app_context.enhanced_llm_service:
+                        # Use enhanced LLM service if available
+                        response = await self.app_context.enhanced_llm_service.handle_user_text_query(
+                            user_text=message,
+                            user_name=user_name,
+                            text_callback=text_only_callback,
+                            tts_callback=tts_callback  # Enable TTS for text chat
+                        )
+                    elif hasattr(self.app_context, 'model_client'):
+                        # Fallback to basic model client
+                        try:
+                            # Create a simple prompt
+                            prompt = f"User ({user_name}): {message}\n\nDanzarAI:"
+                            
+                            # Get response from model client
+                            response = await self.app_context.model_client.get_completion(
+                                prompt=prompt,
+                                max_tokens=500,
+                                temperature=0.7
+                            )
+                            
+                            if response and response.strip():
+                                await text_only_callback(response)
+                            else:
+                                await ctx.send("🤖 **DanzarAI:** I'm sorry, I couldn't generate a response. Please try again.")
+                                
+                        except Exception as e:
+                            self.logger.error(f"Error in basic LLM response: {e}")
+                            await ctx.send("❌ **Error:** Failed to get response from language model.")
+                    else:
+                        await ctx.send("❌ **LLM Service Not Available**\n"
+                                     "The language model service is not currently available.")
+                        
+            except Exception as e:
+                self.logger.error(f"Error in danzar command: {e}")
+                await ctx.send("❌ **Error:** Something went wrong while processing your message. Please try again.")
 
         @self.command(name='offline')
         async def offline_command(ctx):
@@ -1744,43 +2380,117 @@ class DanzarVoiceBot(commands.Bot):
         async def memory_command(ctx, action: str = "status", user: Optional[str] = None):
             """Memory management commands"""
             try:
+                mm = getattr(self.app_context, 'memory_manager', None)
+                if not mm:
+                    await ctx.send("❌ Memory manager not available")
+                    return
+                    
                 if action == "status":
-                    if self.app_context.short_term_memory_service:
-                        stats = self.app_context.short_term_memory_service.get_stats()
-                        await ctx.send(f"📊 **Memory Status**\n"
-                                     f"Active conversations: {stats['active_conversations']}\n"
-                                     f"Total entries: {stats['total_entries']}\n"
-                                     f"Memory usage: {stats['memory_usage_mb']:.1f} MB")
-                    else:
-                        await ctx.send("❌ Memory service not available")
+                    stats = mm.get_memory_stats()
+                    if 'error' in stats:
+                        await ctx.send(f"❌ Memory stats error: {stats['error']}")
+                        return
+                        
+                    await ctx.send(f"🧠 **Hybrid Memory Status**\n"
+                                 f"**STM Buffer**: {stats['stm_buffer_size']} turns\n"
+                                 f"**LTM Buffer**: {stats['ltm_buffer_size']} entries\n"
+                                 f"**STM Collection**: {stats['stm_collection_count']} entries\n"
+                                 f"**LTM Collection**: {stats['ltm_collection_count']} entries\n"
+                                 f"**Initialized**: {'✅' if stats['initialized'] else '❌'}\n"
+                                 f"**Embedding Model**: {stats['config']['embedding_model']}")
                         
                 elif action == "clear":
                     if user:
-                        if self.app_context.short_term_memory_service:
-                            self.app_context.short_term_memory_service.clear_conversation(user)
-                            await ctx.send(f"🗑️ Cleared memory for user: {user}")
-                        else:
-                            await ctx.send("❌ Memory service not available")
+                        # Clear specific user's memory
+                        mm.clear_memory('stm')  # Clear STM for now
+                        await ctx.send(f"🗑️ Cleared STM memory for user: {user}")
                     else:
-                        await ctx.send("❌ Please specify a user: `!memory clear <username>`")
+                        # Clear all memory
+                        mm.clear_memory('stm')
+                        mm.clear_memory('ltm')
+                        await ctx.send("🗑️ Cleared all memory (STM and LTM)")
                         
-                elif action == "list":
-                    if self.app_context.short_term_memory_service:
-                        conversations = self.app_context.short_term_memory_service.get_active_conversations()
-                        if conversations:
-                            conv_list = "\n".join([f"• {user} ({count} entries)" for user, count in conversations.items()])
-                            await ctx.send(f"💭 **Active Conversations**\n{conv_list}")
-                        else:
-                            await ctx.send("📭 No active conversations")
-                    else:
-                        await ctx.send("❌ Memory service not available")
-                        
-                else:
-                    await ctx.send("❌ Invalid action. Use: `status`, `clear <user>`, or `list`")
+                elif action == "stats":
+                    stats = mm.get_memory_stats()
+                    if 'error' in stats:
+                        await ctx.send(f"❌ Memory stats error: {stats['error']}")
+                        return
                     
+                    await ctx.send(f"📊 **Memory Statistics**\n"
+                                 f"**STM Buffer Size**: {stats['stm_buffer_size']}\n"
+                                 f"**LTM Buffer Size**: {stats['ltm_buffer_size']}\n"
+                                 f"**STM Collection Count**: {stats['stm_collection_count']}\n"
+                                 f"**LTM Collection Count**: {stats['ltm_collection_count']}\n"
+                                 f"**Total Memory Entries**: {stats['stm_buffer_size'] + stats['ltm_buffer_size']}")
+                else:
+                    await ctx.send("❓ **Unknown memory command!**\n"
+                                  "Available commands: `status`, `clear [user]`, `stats`")
             except Exception as e:
-                self.logger.error(f"Memory command error: {e}")
-                await ctx.send("❌ Memory command failed")
+                await ctx.send(f"❌ Memory command error: {e}")
+
+        @self.command(name='gpu')
+        async def gpu_command(ctx, action: str = "status"):
+            """GPU memory management commands"""
+            try:
+                gpu_mm = getattr(self.app_context, 'gpu_memory_manager', None)
+                if not gpu_mm:
+                    await ctx.send("❌ GPU Memory Manager not available")
+                    return
+                    
+                if action == "status":
+                    # Get memory info for all devices
+                    memory_info = gpu_mm.get_all_devices_memory_info()
+                    
+                    if not memory_info:
+                        await ctx.send("❌ No GPU devices found or CUDA not available")
+                        return
+                    
+                    status_msg = "🎯 **GPU Memory Status:**\n\n"
+                    
+                    for device_id, info in memory_info.items():
+                        device_name = gpu_mm.available_devices.get(device_id, {}).get('name', 'Unknown')
+                        status_msg += f"**Device {device_id} ({device_name}):**\n"
+                        status_msg += f"  📊 Allocated: {info['allocated_gb']:.1f}GB\n"
+                        status_msg += f"  📊 Reserved: {info['reserved_gb']:.1f}GB\n"
+                        status_msg += f"  📊 Free: {info['free_gb']:.1f}GB\n"
+                        status_msg += f"  📊 Total: {info['total_gb']:.1f}GB\n"
+                        status_msg += f"  📊 Utilization: {info['utilization_percent']:.1f}%\n\n"
+                    
+                    # Add recommendations
+                    recommendations = gpu_mm.get_memory_recommendations()
+                    if recommendations:
+                        status_msg += "💡 **Recommendations:**\n"
+                        for rec in recommendations:
+                            status_msg += f"  • {rec}\n"
+                    
+                    await ctx.send(status_msg)
+                    
+                elif action == "vision":
+                    # Show best device for vision processing
+                    device, reason = gpu_mm.get_best_vision_device()
+                    await ctx.send(f"👁️ **Best Vision Device:**\n"
+                                 f"**Device**: {device}\n"
+                                 f"**Reason**: {reason}")
+                    
+                elif action == "monitor":
+                    # Toggle memory monitoring
+                    if gpu_mm.enable_monitoring:
+                        gpu_mm.stop_memory_monitoring()
+                        await ctx.send("🛑 **GPU Memory Monitoring Stopped**")
+                    else:
+                        gpu_mm.start_memory_monitoring()
+                        await ctx.send("📊 **GPU Memory Monitoring Started**")
+                        
+                elif action == "log":
+                    # Log current memory status
+                    gpu_mm.log_memory_status()
+                    await ctx.send("📝 **GPU Memory Status logged to console**")
+                    
+                else:
+                    await ctx.send("❓ **Unknown GPU command!**\n"
+                                  "Available commands: `status`, `vision`, `monitor`, `log`")
+            except Exception as e:
+                await ctx.send(f"❌ GPU command error: {e}")
 
         @self.command(name='search')
         async def search_command(ctx, mode: str = "status"):
@@ -2280,8 +2990,14 @@ class DanzarVoiceBot(commands.Bot):
                 
                 elif action == "game":
                     if args:
-                        service.set_game_type(args)
-                        await ctx.send(f"🎮 **Game type set to: {args}**")
+                        # Load the new game profile and update app_context
+                        new_profile = load_game_profile(args.strip().lower(), self.app_context.global_settings)
+                        if new_profile:
+                            self.app_context.update_active_profile(new_profile)
+                            service.set_game_type(args)
+                            await ctx.send(f"🎮 **Game type set to: {args}** (profile loaded)")
+                        else:
+                            await ctx.send(f"❌ **Profile not found for game type: {args}**")
                     else:
                         await ctx.send(f"🎮 **Current game type: {service.current_game}**")
                 
@@ -2313,6 +3029,109 @@ class DanzarVoiceBot(commands.Bot):
             except Exception as e:
                 self.logger.error(f"❌ Conversation command error: {e}")
                 await ctx.send("❌ **Error processing conversation command**")
+
+        # Watch Commands for Vision Commentary
+        @self.command(name='watch')
+        async def watch_command(ctx):
+            """Start watching and providing vision commentary"""
+            try:
+                self.logger.info(f"👁️ !watch used by {ctx.author.name}")
+                
+                # Check if vision integration service is available
+                if not hasattr(self.app_context, 'vision_integration_service') or not self.app_context.vision_integration_service:
+                    await ctx.send("❌ **Vision Integration Service not available**\n"
+                                  "Make sure the Qwen2.5-VL server is running and vision services are initialized")
+                    return
+                
+                # Define callbacks as instance methods to prevent scope issues
+                async def text_callback(text: str):
+                    """Text callback that sends commentary to Discord."""
+                    try:
+                        if self.logger:
+                            self.logger.info(f"[VisionIntegration] >>> ENTERED TEXT CALLBACK with: '{text.strip()[:50]}...'")
+                        
+                        text_channel = self.get_configured_text_channel()
+                        if text_channel:
+                            if self.logger:
+                                self.logger.info(f"[VisionIntegration] Sending commentary to text channel: {text_channel.name}")
+                            await text_channel.send(f"👁️ **Vision Commentary**: {text}")
+                            if self.logger:
+                                self.logger.info(f"[VisionIntegration] Commentary text sent successfully")
+                        else:
+                            if self.logger:
+                                self.logger.warning("[VisionIntegration] No configured text channel available for commentary")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"[VisionIntegration] Error in text callback: {e}", exc_info=True)
+                
+                async def tts_callback(text: str):
+                    """TTS callback that plays commentary audio."""
+                    try:
+                        if self.logger:
+                            self.logger.info(f"[VisionIntegration] >>> ENTERED TTS CALLBACK with: '{text.strip()[:50]}...'")
+                        
+                        if hasattr(self.app_context, 'tts_service') and self.app_context.tts_service:
+                            tts_audio = await self.app_context.tts_service.synthesize_speech(text)
+                            if tts_audio:
+                                await self._play_tts_audio_with_feedback_prevention(tts_audio)
+                                if self.logger:
+                                    self.logger.info(f"[VisionIntegration] TTS audio played successfully")
+                            else:
+                                if self.logger:
+                                    self.logger.warning("[VisionIntegration] TTS service returned no audio")
+                        else:
+                            if self.logger:
+                                self.logger.warning("[VisionIntegration] No TTS service available")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"[VisionIntegration] TTS callback error: {e}", exc_info=True)
+                
+                # Store callbacks as instance attributes to prevent garbage collection
+                self._vision_text_callback = text_callback
+                self._vision_tts_callback = tts_callback
+                
+                # Start watching with stored callbacks
+                success = await self.app_context.vision_integration_service.start_watching(
+                    text_callback=self._vision_text_callback,
+                    tts_callback=self._vision_tts_callback
+                )
+                
+                if success:
+                    await ctx.send("✅ **Vision commentary started!**\n"
+                                  "👁️ I'm now watching and will provide commentary on what I see\n"
+                                  "🎯 Use `!stopwatch` to stop the commentary")
+                else:
+                    await ctx.send("❌ **Failed to start vision commentary**\n"
+                                  "Please check the vision service status")
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Watch command error: {e}", exc_info=True)
+                await ctx.send(f"❌ **Error starting vision commentary**: {str(e)}")
+
+        @self.command(name='stopwatch')
+        async def stopwatch_command(ctx):
+            """Stop watching and vision commentary"""
+            try:
+                self.logger.info(f"🛑 !stopwatch used by {ctx.author.name}")
+                
+                # Check if vision integration service is available
+                if not hasattr(self.app_context, 'vision_integration_service') or not self.app_context.vision_integration_service:
+                    await ctx.send("❌ **Vision Integration Service not available**")
+                    return
+                
+                # Stop watching
+                success = await self.app_context.vision_integration_service.stop_watching()
+                
+                if success:
+                    await ctx.send("🛑 **Vision commentary stopped!**\n"
+                                  "👁️ I'm no longer watching\n"
+                                  "🎯 Use `!watch` to start commentary again")
+                else:
+                    await ctx.send("❌ **Failed to stop vision commentary**")
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Stopwatch command error: {e}")
+                await ctx.send(f"❌ **Error stopping vision commentary**: {str(e)}")
 
     async def _video_analyze(self, ctx, prompt: str, use_fast_model: bool = False):
         """Analyze current screen with given prompt using Qwen2.5-VL"""
@@ -2365,8 +3184,8 @@ class DanzarVoiceBot(commands.Bot):
         """Start live video monitoring with configurable FPS using Hybrid Vision Service"""
         try:
             # Check if Hybrid Vision Service is available
-            if not hasattr(self.app_context, 'hybrid_vision_service') or not self.app_context.hybrid_vision_service:
-                await ctx.send("❌ **Hybrid Vision Service not available**\n"
+            if not hasattr(self.app_context, 'qwen_vision_service') or not self.app_context.qwen_vision_service:
+                await ctx.send("❌ **Qwen Vision Service not available**\n"
                               "Make sure the vision services are properly set up and OBS Studio is running")
                 return
             
@@ -2376,7 +3195,7 @@ class DanzarVoiceBot(commands.Bot):
                 return
             
             interval = 1.0 / fps
-            await ctx.send(f"🎬 **Starting live video monitoring with Hybrid Vision Service**\n"
+            await ctx.send(f"🎬 **Starting live video monitoring with Qwen Vision Service**\n"
                           f"⏱️ Duration: {duration} seconds\n"
                           f"🎯 FPS: {fps} (analysis every {interval:.1f}s)")
             
@@ -2942,6 +3761,8 @@ class DanzarVoiceBot(commands.Bot):
     async def setup_hook(self):
         # Set the event loop for async operations
         self.loop = asyncio.get_event_loop()
+        # Set the event loop on app_context for background threads to access
+        self.app_context.loop = self.loop
         """Setup hook called after login but before connecting to gateway."""
         self.logger.info("Loading Whisper and VAD models in setup_hook...")
         try:
@@ -2974,6 +3795,8 @@ class DanzarVoiceBot(commands.Bot):
         except Exception as e:
             self.logger.error(f"Failed to load models: {e}")
             self.whisper_model = None
+        
+        # Note: Cogs are now loaded in on_ready() after services are initialized
 
     def _check_windows_audio_optimization(self):
         """Check and suggest Windows audio optimizations for Discord processing."""
@@ -3018,6 +3841,48 @@ class DanzarVoiceBot(commands.Bot):
         
         # Initialize services after bot is ready
         await self.initialize_services()
+        
+        # Attach vision integration service to bot for Cogs to access
+        if hasattr(self.app_context, 'vision_integration_service') and self.app_context.vision_integration_service:
+            self.vision_integration_service = self.app_context.vision_integration_service
+            self.logger.info("👁️ Vision integration service attached to bot for Cog access")
+        else:
+            self.logger.warning("⚠️ Vision integration service not available for Cogs")
+        
+        # Load Cogs after services are initialized
+        self.logger.info("🔧 Loading Cogs...")
+        try:
+            # Load vision cog
+            from discord_integration.vision_cog import setup as setup_vision_cog
+            await setup_vision_cog(self)
+            self.logger.info("✅ Vision Cog loaded")
+            
+            # Load voice cog
+            from discord_integration.voice_cog import setup as setup_voice_cog
+            await setup_voice_cog(self)
+            self.logger.info("✅ Voice Cog loaded")
+            
+            # Log all registered commands
+            command_names = [cmd.name for cmd in self.commands]
+            self.logger.info(f"📋 All registered commands: {command_names}")
+            
+            # Check specific commands
+            watch_cmd = self.get_command('watch')
+            stopwatch_cmd = self.get_command('stopwatch')
+            join_cmd = self.get_command('join')
+            leave_cmd = self.get_command('leave')
+            video_cmd = self.get_command('video')
+            
+            self.logger.info(f"👁️ !watch command: {'✅ Found' if watch_cmd else '❌ Not found'}")
+            self.logger.info(f"🛑 !stopwatch command: {'✅ Found' if stopwatch_cmd else '❌ Not found'}")
+            self.logger.info(f"📞 !join command: {'✅ Found' if join_cmd else '❌ Not found'}")
+            self.logger.info(f"🚪 !leave command: {'✅ Found' if leave_cmd else '❌ Not found'}")
+            self.logger.info(f"🎥 !video command: {'✅ Found' if video_cmd else '❌ Not found'}")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error loading Cogs: {e}")
+            import traceback
+            self.logger.error(f"Stack trace: {traceback.format_exc()}")
         
         # Start transcription queue processor
         asyncio.create_task(self.process_transcription_queue())
@@ -3371,8 +4236,7 @@ class DanzarVoiceBot(commands.Bot):
                         # Split into single-word patterns and phrase patterns for better matching
                         single_word_noise = ["um", "uh", "ah", "oh", "mm", "hmm", "hm", "eh", "er"]
                         phrase_noise_patterns = [
-                            "music", "sound", "audio", "noise", "background",
-                            # TTS-specific patterns that often get picked up
+                            # Only exact TTS-specific phrases that are unlikely to be legitimate user speech
                             "i'm having trouble processing", "please try again", "error processing",
                             "audio transcription failed", "i encountered an error", 
                             "that right now", "sorry to hear", "clarify what",
@@ -3388,13 +4252,19 @@ class DanzarVoiceBot(commands.Bot):
                             self.logger.info(f"🛡️ Ignoring single-word noise in queue: '{transcription}' (exact match: '{transcription_clean}')")
                             is_noise = True
                         
-                        # Check for phrase patterns (substring match for longer phrases only)
+                        # Check for phrase patterns (exact phrase match only, not substring)
                         if not is_noise:
                             for pattern in phrase_noise_patterns:
-                                if pattern in transcription_clean:
+                                # Only match if the pattern is the ENTIRE transcription or a complete phrase within it
+                                if pattern == transcription_clean or f" {pattern} " in f" {transcription_clean} ":
                                     self.logger.info(f"🛡️ Ignoring TTS echo/noise pattern in queue: '{transcription}' (matched: '{pattern}')")
                                     is_noise = True
                                     break
+                        
+                        # Additional safety: If transcription is long (>50 chars), it's very unlikely to be TTS echo
+                        if is_noise and len(transcription_clean) > 50:
+                            self.logger.info(f"🛡️ Overriding noise detection for long transcription ({len(transcription_clean)} chars): '{transcription[:50]}...'")
+                            is_noise = False
                         
                         if is_noise:
                             continue
@@ -3879,7 +4749,7 @@ class DanzarVoiceBot(commands.Bot):
                 user_text=transcription,
                 user_name=user_name,
                 text_callback=text_callback,
-                tts_callback=tts_callback,
+                tts_callback=tts_callback,  # Enable TTS for text chat
                 progress_callback=progress_callback
             )
             
@@ -3951,9 +4821,35 @@ class DanzarVoiceBot(commands.Bot):
                     # Generate and play TTS using chunked approach
                     await self._generate_and_play_chunked_tts(clean_response, text_channel, user_name)
                     
-                else:
-                    await text_channel.send("🤖 **DanzarAI**: I heard you, but I'm not sure how to respond to that.")
+                    # Store bot response in memory
+                    if hasattr(self.app_context, 'memory_manager') and self.app_context.memory_manager:
+                        try:
+                            # Add bot response to STM
+                            metadata = {
+                                'user': 'Danzar',
+                                'type': 'bot_response',
+                                'timestamp': datetime.now().isoformat()
+                            }
+                            self.app_context.memory_manager.upsert_stm(clean_response, metadata)
+                            self.logger.info(f"🧠 Stored bot response in memory: '{clean_response[:50]}...'")
+                        except Exception as e:
+                            self.logger.error(f"Memory storage error for bot response: {e}")
                     
+                    # Generate TTS if available
+                    if hasattr(self, 'tts_service') and self.tts_service:
+                        try:
+                            tts_audio = self.tts_service.generate_audio(clean_response)
+                            if tts_audio:
+                                await self._queue_tts_audio(tts_audio)
+                                self.logger.info(f"🎵 TTS generated for conversational response ({len(tts_audio)} bytes)")
+                        except Exception as e:
+                            self.logger.error(f"❌ TTS generation error: {e}")
+                    
+                    # Reset conversation state after speaking
+                    await asyncio.sleep(1)  # Brief pause
+                    service.conversation_state = service.ConversationState.IDLE
+                else:
+                    self.logger.info(f"⏳ User {user_name} must wait for turn")
             else:
                 # Fallback response
                 response = f"I heard you say: '{transcription}'. My LLM service isn't available right now."
@@ -4179,9 +5075,46 @@ class DanzarVoiceBot(commands.Bot):
             self.logger.error(f"Error processing Discord audio: {e}")
 
     async def _process_transcription(self, transcription: str, user_name: str):
-        """Process transcription with conversational AI service for turn-taking"""
+        """Process transcription with enhanced LLM service including STT correction and fact checking"""
         try:
-            # Use conversational AI service if available
+            # Use enhanced LLM service if available for STT correction and fact checking
+            if hasattr(self.app_context, 'llm_service') and self.app_context.llm_service:
+                try:
+                    # Get current game context
+                    game_context = None
+                    if hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
+                        game_context = self.app_context.active_profile.game_name
+                    
+                    # Process with enhanced LLM service (includes STT correction and fact checking)
+                    response = await self.app_context.llm_service.process_user_input(
+                        user_input=transcription,
+                        username=user_name,
+                        game_context=game_context
+                    )
+                    
+                    if response:
+                        # Send response to Discord
+                        text_channel = self.get_configured_text_channel()
+                        if text_channel:
+                            await text_channel.send(f"🤖 **Danzar**: {response}")
+                        
+                        # Generate TTS if available
+                        if hasattr(self, 'tts_service') and self.tts_service:
+                            try:
+                                tts_audio = self.tts_service.generate_audio(response)
+                                if tts_audio:
+                                    await self._queue_tts_audio(tts_audio)
+                                    self.logger.info(f"🎵 TTS generated for enhanced response ({len(tts_audio)} bytes)")
+                            except Exception as e:
+                                self.logger.error(f"❌ TTS generation error: {e}")
+                        
+                        return
+                    
+                except Exception as e:
+                    self.logger.error(f"Enhanced LLM service error: {e}")
+                    # Fall back to regular processing
+            
+            # Fallback to conversational AI service if enhanced LLM service not available
             if (hasattr(self.app_context, 'conversational_ai_service') and 
                 self.app_context.conversational_ai_service):
                 
@@ -4213,6 +5146,20 @@ class DanzarVoiceBot(commands.Bot):
                     if text_channel:
                         await text_channel.send(f"🤖 **Danzar**: {response}")
                     
+                    # Store bot response in memory
+                    if hasattr(self.app_context, 'memory_manager') and self.app_context.memory_manager:
+                        try:
+                            # Add bot response to STM
+                            metadata = {
+                                'user': 'Danzar',
+                                'type': 'bot_response',
+                                'timestamp': datetime.now().isoformat()
+                            }
+                            self.app_context.memory_manager.upsert_stm(response, metadata)
+                            self.logger.info(f"🧠 Stored bot response in memory: '{response[:50]}...'")
+                        except Exception as e:
+                            self.logger.error(f"Memory storage error for bot response: {e}")
+                    
                     # Generate TTS if available
                     if hasattr(self, 'tts_service') and self.tts_service:
                         try:
@@ -4237,7 +5184,7 @@ class DanzarVoiceBot(commands.Bot):
                     self.logger.warning("No text channel configured for responses")
                 
         except Exception as e:
-            self.logger.error(f"❌ Error processing transcription with conversational AI: {e}")
+            self.logger.error(f"❌ Error processing transcription: {e}")
             # Fallback to regular processing
             text_channel = self.get_configured_text_channel()
             if text_channel:
@@ -4551,19 +5498,23 @@ async def main():
         
         logger.info("🚀 Starting DanzarAI with Full Voice Integration (STT → LLM → TTS)...")
 
-        # Create a game profile for Discord voice bot
-        from core.game_profile import GameProfile
-        discord_profile = GameProfile(
-            game_name="discord_voice",
-            vlm_model="qwen2.5:7b",
-            system_prompt_commentary="You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. Use gamer lingo naturally, but explain anything arcane so newcomers feel included. Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.",
-            user_prompt_template_commentary="User said: {user_text}. Respond helpfully about gaming.",
-            vlm_max_tokens=200,
-            vlm_temperature=0.7,
-            vlm_max_commentary_sentences=2,
-            conversational_llm_model="qwen2.5:7b",
-            system_prompt_chat="You are Danzar, an upbeat and witty gaming assistant who's always ready to help players crush their goals in EverQuest (or any game). Speak casually, like a friendly raid leader—cheer people on, crack a clever joke now and then, and keep the energy high. When giving advice, be forward-thinking: mention upcoming expansions, meta strategies, or ways to optimize both platinum farming and experience gains. Use gamer lingo naturally, but explain anything arcane so newcomers feel included. Above all, stay encouraging—everyone levels up at their own pace, and you're here to make the journey fun and rewarding.\n\nIMPORTANT: You are receiving voice transcriptions that may contain errors from speech-to-text processing. If a word or phrase seems out of context, unclear, or doesn't make sense, use your best judgment to interpret what the user likely meant based on the conversation context. Common STT errors include:\n- Homophones (e.g., 'there' vs 'their', 'to' vs 'too')\n- Similar-sounding words (e.g., 'game' vs 'gain', 'quest' vs 'test')\n- Missing or extra words\n- Punctuation errors\n- Background noise interpreted as words\n\nIf you're unsure about a transcription, you can ask for clarification, but try to respond naturally to what you believe the user intended to say."
-        )
+        # Load the appropriate game profile instead of creating a hardcoded one
+        from core.config_loader import load_game_profile
+        
+        # Use the profile specified in args, or default from settings, or fallback to generic
+        profile_name = args.profile or settings.get('DEFAULT_GAME_PROFILE', 'generic')
+        discord_profile = load_game_profile(profile_name, settings)
+        
+        if not discord_profile:
+            logger.warning(f"⚠️ Failed to load profile '{profile_name}', falling back to generic")
+            discord_profile = load_game_profile('generic', settings)
+        
+        if not discord_profile:
+            logger.error("❌ Failed to load any game profile!")
+            return
+        
+        logger.info(f"✅ Loaded game profile: {discord_profile.game_name}")
+        
         app_context = AppContext(settings, discord_profile, logger)
 
         # Create the Discord bot with voice capabilities and full service integration

@@ -5,9 +5,20 @@ import socket
 import logging
 import queue
 from typing import Optional, Tuple
-import NDIlib as ndi
 import cv2
 import threading
+
+# Import NDI library - use the correct package name
+try:
+    import NDIlib as ndi
+    NDI_AVAILABLE = True
+except ImportError:
+    try:
+        import ndi
+        NDI_AVAILABLE = True
+    except ImportError:
+        NDI_AVAILABLE = False
+        ndi = None
 
 # Note: Don't import NDI libraries directly here, will be initialized dynamically
 # This allows the services to be instantiated on systems without NDI libraries
@@ -32,6 +43,11 @@ class NDIService:
         self.current_source_idx = 0
         self.next_source_scan_time = 0
         self.last_source_change_time = 0
+        
+        # Check if NDI is available
+        if not NDI_AVAILABLE:
+            self.logger.error("[NDIService] NDI library not available. Install with: pip install ndi-python")
+            return
         
         # Try to initialize NDI
         self._initialize_ndi()
@@ -73,6 +89,11 @@ class NDIService:
             self.is_initialized = True
 
     def initialize_ndi(self) -> bool:
+        """Initialize NDI library and connection."""
+        if not NDI_AVAILABLE or ndi is None:
+            self.logger.error("[NDIService] NDI library not available. Cannot initialize.")
+            return False
+            
         self.logger.info("[NDIService] Initializing NDI library and connection...")
         gs = self.app_context.global_settings
         try:
@@ -178,6 +199,32 @@ class NDIService:
         self.recv_instance = None
         self.logger.info("[NDIService] NDIlib initialized successfully")
 
+    def _init_pyndi4(self, ndi):
+        """Initialize using PyNDI4"""
+        if not ndi.initialize():
+            raise RuntimeError("Failed to initialize NDI")
+        
+        self.ndi = ndi
+        self.find_instance = self.ndi.find_create_v2()
+        if not self.find_instance:
+            raise RuntimeError("Failed to create NDI finder")
+            
+        self.recv_instance = None
+        self.logger.info("[NDIService] PyNDI4 initialized successfully")
+
+    def _init_ndi_standard(self, ndi):
+        """Initialize using standard NDI library"""
+        if not ndi.initialize():
+            raise RuntimeError("Failed to initialize NDI")
+        
+        self.ndi = ndi
+        self.find_instance = self.ndi.find_create_v2()
+        if not self.find_instance:
+            raise RuntimeError("Failed to create NDI finder")
+            
+        self.recv_instance = None
+        self.logger.info("[NDIService] Standard NDI library initialized successfully")
+
     def _frame_to_bgr(self, vf: ndi.VideoFrameV2) -> Optional[np.ndarray]:
         try:
             if vf.data is None or vf.xres <= 0 or vf.yres <= 0:
@@ -226,29 +273,35 @@ class NDIService:
             return None
 
     def run_capture_loop(self):
-        """Main NDI frame capture loop."""
+        """Main NDI frame capture loop with frame rate limiting."""
         if not self.is_initialized:
             self.initialize_ndi()
             if not self.is_initialized:
                 self.logger.error("[NDIService] Failed to initialize NDI. Capture loop cannot start.")
                 return
 
-        self.logger.info("[NDIService] Starting NDI frame capture loop...")
+        self.logger.info("[NDIService] Starting NDI frame capture loop with frame rate limiting...")
         gs = self.app_context.global_settings
+        
+        # Get frame rate settings
+        target_fps = gs.get('vision_capture_fps', 1)  # Default to 1 FPS
+        frame_interval = 1.0 / target_fps if target_fps > 0 else 1.0
         receive_timeout_ms = gs.get('NDI_RECEIVE_TIMEOUT_MS', 1000)
 
         loop_count = 0
-        # --- HEARTBEAT LOGGING (from your previous addition) ---
+        last_frame_time = 0
         last_log_time = time.time()
-        # --- END HEARTBEAT ---
+        frames_captured = 0
+        frames_dropped = 0
+
+        self.logger.info(f"[NDIService] Target capture rate: {target_fps} FPS (interval: {frame_interval:.3f}s)")
 
         while not self.app_context.shutdown_event.is_set():
-            # --- HEARTBEAT LOGIC ---
-            now_time = time.time() # Renamed to avoid conflict with time module if used directly
+            # Heartbeat logging
+            now_time = time.time()
             if now_time - last_log_time > 60:
-                self.logger.info("[NDIService] Capture loop still alive and running...")
+                self.logger.info(f"[NDIService] Capture loop alive - Captured: {frames_captured}, Dropped: {frames_dropped}")
                 last_log_time = now_time
-            # --- END HEARTBEAT ---
 
             if not self.ndi_receiver:
                 self.logger.error("[NDIService] NDI receiver is None in capture loop. Attempting re-initialization.")
@@ -260,31 +313,57 @@ class NDIService:
                     self.logger.info("[NDIService] Re-initialized successfully. Continuing capture.")
                     continue
 
+            # Check if enough time has passed for next frame
+            time_since_last = now_time - last_frame_time
+            if time_since_last < frame_interval:
+                # Sleep until next frame time
+                sleep_time = frame_interval - time_since_last
+                time.sleep(sleep_time)
+                continue
+
             frame_type, video_frame, audio_frame, metadata_frame = ndi.recv_capture_v2(self.ndi_receiver, receive_timeout_ms)
-            loop_count+=1
+            loop_count += 1
 
             if frame_type == ndi.FRAME_TYPE_VIDEO:
-                if loop_count % 100 == 0:
+                if loop_count % 50 == 0:
                     self.logger.debug(f"[NDIService] Video frame received (loop {loop_count}). Timestamp: {video_frame.timestamp if video_frame else 'N/A'}")
 
                 bgr_image = self._frame_to_bgr(video_frame)
                 ndi.recv_free_video_v2(self.ndi_receiver, video_frame)
 
                 if bgr_image is not None:
-                    if self.app_context.ndi_commentary_enabled.is_set():
-                        try:
-                            self.app_context.frame_queue.put_nowait(bgr_image)
-                        except queue.Full:
-                            self.logger.warning("[NDIService] Frame queue full. Clearing queue and adding latest frame.")
-                            while not self.app_context.frame_queue.empty():
-                                try:
-                                    self.app_context.frame_queue.get_nowait()
-                                except queue.Empty:
-                                    break
+                    # Only process frame if enough time has passed
+                    if now_time - last_frame_time >= frame_interval:
+                        if self.app_context.ndi_commentary_enabled.is_set():
                             try:
                                 self.app_context.frame_queue.put_nowait(bgr_image)
+                                frames_captured += 1
+                                last_frame_time = now_time
+                                
+                                if frames_captured % 10 == 0:
+                                    self.logger.info(f"[NDIService] Captured {frames_captured} frames at {target_fps} FPS")
+                                    
                             except queue.Full:
-                                self.logger.error("[NDIService] Frame queue still full after clearing. Dropping frame.")
+                                frames_dropped += 1
+                                self.logger.warning(f"[NDIService] Frame queue full. Dropping frame. (Captured: {frames_captured}, Dropped: {frames_dropped})")
+                                
+                                # Clear queue and add latest frame
+                                while not self.app_context.frame_queue.empty():
+                                    try:
+                                        self.app_context.frame_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                try:
+                                    self.app_context.frame_queue.put_nowait(bgr_image)
+                                    frames_captured += 1
+                                    last_frame_time = now_time
+                                except queue.Full:
+                                    self.logger.error("[NDIService] Frame queue still full after clearing. Dropping frame.")
+                    else:
+                        # Skip this frame due to rate limiting
+                        frames_dropped += 1
+                        if frames_dropped % 20 == 0:
+                            self.logger.debug(f"[NDIService] Rate limiting: dropped {frames_dropped} frames")
 
                 # Store the last captured frame for manual screenshot capture
                 self.last_captured_frame = bgr_image.copy() if bgr_image is not None else None
@@ -292,7 +371,6 @@ class NDIService:
             elif frame_type == ndi.FRAME_TYPE_AUDIO:
                 if audio_frame: ndi.recv_free_audio_v2(self.ndi_receiver, audio_frame)
             elif frame_type == ndi.FRAME_TYPE_METADATA:
-                self.logger.debug(f"[NDIService] Metadata frame: {metadata_frame.data if metadata_frame else 'N/A'}. Freeing.")
                 if metadata_frame: ndi.recv_free_metadata(self.ndi_receiver, metadata_frame)
             elif frame_type == ndi.FRAME_TYPE_ERROR:
                 self.logger.error("[NDIService] NDI recv_capture_v2 reported FRAME_TYPE_ERROR.")
@@ -305,14 +383,18 @@ class NDIService:
             else:
                 self.logger.warning(f"[NDIService] Received unhandled NDI frame type: {frame_type}")
 
-            if frame_type != ndi.FRAME_TYPE_VIDEO: # Only sleep if not a video frame to keep video processing responsive
-                 time.sleep(0.01) # Small sleep if not processing video
+            # Small sleep to prevent CPU spinning
+            if frame_type != ndi.FRAME_TYPE_VIDEO:
+                time.sleep(0.01)
 
-        # This part is correctly indented to be outside the while loop
-        self.logger.info("[NDIService] NDI capture loop has been signaled to stop or exited.")
+        # Final stats
+        self.logger.info(f"[NDIService] NDI capture loop stopped. Final stats - Captured: {frames_captured}, Dropped: {frames_dropped}")
         self.cleanup()
 
     def _cleanup_finder_and_library(self):
+        if not NDI_AVAILABLE or ndi is None:
+            return
+            
         if self.ndi_finder:
             ndi.find_destroy(self.ndi_finder)
             self.ndi_finder = None
@@ -322,6 +404,10 @@ class NDIService:
 
     def cleanup(self):
         self.logger.info("[NDIService] Initiating NDI cleanup...")
+        if not NDI_AVAILABLE or ndi is None:
+            self.logger.info("[NDIService] NDI not available, skipping cleanup.")
+            return
+            
         if self.ndi_receiver:
             ndi.recv_destroy(self.ndi_receiver)
             self.ndi_receiver = None

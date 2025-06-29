@@ -1,6 +1,5 @@
 """
-LLaVA LlamaCpp Service for DanzarVLM
-Direct integration with llama.cpp for vision analysis using LLaVA models
+LLaVA llama.cpp Service - Clean vision language model integration
 """
 
 import asyncio
@@ -17,6 +16,112 @@ import numpy as np
 import cv2
 import aiohttp
 import requests
+from core.app_context import AppContext
+
+class LLaVAService:
+    """Clean LLaVA service using llama.cpp backend"""
+    
+    def __init__(self, app_context: AppContext):
+        self.app_context = app_context
+        self.logger = app_context.logger
+        self.config = app_context.global_settings
+        
+        # Service configuration
+        self.server_port = self.config.get('LLAVA_LLAMACPP', {}).get('server_port', 8083)
+        self.server_url = f"http://localhost:{self.server_port}"
+        self.timeout = 60  # seconds
+        self.is_available = False
+        
+        self.logger.info(f"[LLaVAService] Initialized - Server: {self.server_url}")
+    
+    async def initialize(self) -> bool:
+        """Initialize and check service availability"""
+        self.logger.info("[LLaVAService] Checking LLaVA server availability...")
+        
+        self.is_available = await self._check_server_health()
+        
+        self.logger.info(f"[LLaVAService] Server available: {self.is_available}")
+        
+        return self.is_available
+    
+    async def _check_server_health(self) -> bool:
+        """Check if LLaVA server is healthy"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.server_url}/health", timeout=5) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get('status') == 'ok'
+        except Exception as e:
+            self.logger.warning(f"[LLaVAService] Health check failed: {e}")
+        return False
+    
+    async def analyze_image(self, image_data: str, prompt: str) -> Optional[Dict[str, Any]]:
+        """
+        Analyze image with LLaVA
+        
+        Args:
+            image_data: Base64 encoded image
+            prompt: Analysis prompt
+        
+        Returns:
+            Analysis result or None if failed
+        """
+        if not self.is_available:
+            self.logger.error("[LLaVAService] Server not available")
+            return None
+        
+        try:
+            # Prepare request payload
+            payload = {
+                "model": "llava",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                        ]
+                    }
+                ],
+                "max_tokens": 500,
+                "temperature": 0.7
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.server_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=self.timeout
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        content = data['choices'][0]['message']['content']
+                        
+                        return {
+                            "analysis": content,
+                            "service_used": "llava",
+                            "timestamp": asyncio.get_event_loop().time()
+                        }
+                    else:
+                        self.logger.error(f"[LLaVAService] API error {response.status}")
+                        return None
+                        
+        except asyncio.TimeoutError:
+            self.logger.error("[LLaVAService] Request timed out")
+            return None
+        except Exception as e:
+            self.logger.error(f"[LLaVAService] Analysis failed: {e}")
+            return None
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get service status"""
+        return {
+            "service": "llava",
+            "server_available": self.is_available,
+            "server_url": self.server_url,
+            "timeout": self.timeout
+        }
 
 class LLaVALlamaCppService:
     """Service for LLaVA vision analysis using llama.cpp"""
@@ -40,7 +145,7 @@ class LLaVALlamaCppService:
         
         # Server mode settings
         self.server_host = self.config.get('LLAVA_LLAMACPP', {}).get('server_host', 'localhost')
-        self.server_port = self.config.get('LLAVA_LLAMACPP', {}).get('server_port', 8084)
+        self.server_port = self.config.get('LLAVA_LLAMACPP', {}).get('server_port', 8083)
         self.use_server_mode = self.config.get('LLAVA_LLAMACPP', {}).get('use_server_mode', True)
         
         # Performance tracking

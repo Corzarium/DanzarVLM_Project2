@@ -18,6 +18,12 @@ safetensors==0.4.1
 sentencepiece==0.1.99
 sentence-transformers==2.7.0
 
+# LangChain for tool integration and agentic behavior
+langchain==0.3.0
+langchain-core==0.3.0
+langchain-community==0.3.0
+langgraph==0.2.0
+
 # Image processing
 opencv-python==4.8.1.78
 Pillow==10.1.0
@@ -61,3 +67,6 @@ numpy>=1.21.0
 py-cord>=2.6.0
 sounddevice>=0.4.5
 soundfile>=0.10.3
+
+# LLM Filters for conditional fact-checking
+llmfilters @ git+https://github.com/piratos/llmfilters

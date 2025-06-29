@@ -3,6 +3,26 @@ import discord
 from discord.ext import commands
 import asyncio
 import time
+import logging
+from typing import Optional, Dict, Any, List, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+# Handle both discord.py and py-cord
+try:
+    import discord
+    from discord.ext import commands
+    # Try to import sinks (py-cord feature)
+    try:
+        from discord import sinks
+        HAS_SINKS = True
+    except ImportError:
+        HAS_SINKS = False
+        print("[DiscordBot] Using discord.py (no voice recording support)")
+except ImportError as e:
+    print(f"[DiscordBot] Discord import error: {e}")
+    HAS_SINKS = False
+
 import queue # For queue.Empty
 import io    # For io.BytesIO
 import threading
@@ -21,6 +41,8 @@ from services.memory_service import MemoryService
 from services.obs_video_service import OBSVideoService
 from core.config_loader import load_global_settings
 from utils.general_utils import setup_logger
+from services.vision_integration_service import VisionIntegrationService
+from services.real_time_streaming_llm import RealTimeStreamingLLMService
 
 # Discord.py will handle Opus loading automatically
 print("[DiscordBot] Using py-cord voice capabilities with recording")
@@ -61,6 +83,8 @@ class DiscordBot(commands.Bot):
         self.connections = {}  # Guild ID -> VoiceClient mapping for recording
         self.whisper_model = None  # Will be loaded in setup_hook
         
+        self.vision_integration_service = VisionIntegrationService(app_context)
+        
         self.logger.info("[DiscordBot] Bot initialized with voice capabilities")
 
         # Debug: Log all methods that have the commands.command decorator
@@ -70,20 +94,52 @@ class DiscordBot(commands.Bot):
                 self.logger.info(f"[DiscordBot] Found command method: {attr_name}")
 
     async def setup_hook(self):
-        """Setup hook called after login but before connecting to gateway."""
+        """Called when the bot is starting up."""
         self.logger.info("🔧 Loading Whisper model in setup_hook...")
+        
+        # Load Whisper model
         try:
-            # Load Whisper model asynchronously to avoid blocking
-            loop = asyncio.get_event_loop()
-            self.whisper_model = await loop.run_in_executor(
-                None, 
-                whisper.load_model, 
-                "tiny"  # Use tiny model for faster processing
-            )
+            from services.faster_whisper_stt_service import FasterWhisperSTTService
+            self.stt_service = FasterWhisperSTTService(self.app_context)
+            await self.stt_service.initialize()
             self.logger.info("✅ Whisper model loaded successfully")
         except Exception as e:
             self.logger.error(f"❌ Failed to load Whisper model: {e}")
-            self.whisper_model = None
+        
+        # Load Cogs
+        self.logger.info("🔧 Loading Cogs...")
+        try:
+            # Load vision cog
+            from discord_integration.vision_cog import setup as setup_vision_cog
+            await setup_vision_cog(self)
+            self.logger.info("✅ Vision Cog loaded")
+            
+            # Load voice cog
+            from discord_integration.voice_cog import setup as setup_voice_cog
+            await setup_voice_cog(self)
+            self.logger.info("✅ Voice Cog loaded")
+            
+            # Log all registered commands
+            command_names = [cmd.name for cmd in self.commands]
+            self.logger.info(f"📋 All registered commands: {command_names}")
+            
+            # Check specific commands
+            watch_cmd = self.get_command('watch')
+            stopwatch_cmd = self.get_command('stopwatch')
+            join_cmd = self.get_command('join')
+            leave_cmd = self.get_command('leave')
+            video_cmd = self.get_command('video')
+            
+            self.logger.info(f"👁️ !watch command: {'✅ Found' if watch_cmd else '❌ Not found'}")
+            self.logger.info(f"🛑 !stopwatch command: {'✅ Found' if stopwatch_cmd else '❌ Not found'}")
+            self.logger.info(f"📞 !join command: {'✅ Found' if join_cmd else '❌ Not found'}")
+            self.logger.info(f"🚪 !leave command: {'✅ Found' if leave_cmd else '❌ Not found'}")
+            self.logger.info(f"🎥 !video command: {'✅ Found' if video_cmd else '❌ Not found'}")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error loading Cogs: {e}")
+            import traceback
+            self.logger.error(f"Stack trace: {traceback.format_exc()}")
 
     async def on_ready(self):
         """Called when bot is ready."""
@@ -91,82 +147,8 @@ class DiscordBot(commands.Bot):
         self.logger.info(f"🎤 Available commands: {', '.join([f'!{cmd.name}' for cmd in self.commands])}")
 
     def _strip_think_tags(self, text: str) -> str:
-        """Remove <think>...</think> tags from LLM responses for Discord"""
-        if not text:
-            return text
-        
-        # Log the original response with think tags for debugging
-        if '<think>' in text.lower():
-            think_content = re.search(r'<think>(.*?)</think>', text, re.DOTALL | re.IGNORECASE)
-            if think_content:
-                self.logger.info(f"[DiscordBot] Model thinking process: {think_content.group(1).strip()[:100]}...")
-        
-        # Remove think tags and their content, keeping only what comes after
-        # Use DOTALL flag to handle multi-line thinking content
-        clean_text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL | re.IGNORECASE)
-        clean_text = clean_text.strip()
-        
-        # If response is empty after stripping think tags, provide fallback
-        if not clean_text and text.strip():
-            clean_text = "I'm thinking about that... let me get back to you."
-            self.logger.warning("[DiscordBot] Response was empty after stripping think tags, using fallback")
-        
-        return clean_text
-
-    # Voice Recording Commands - Following Pycord Guide Pattern
-    @commands.command(name='join')
-    async def join_command(self, ctx):
-        """Join voice channel and start recording."""
-        self.logger.info(f"📞 !join used by {ctx.author.name}")
-        
-        voice = ctx.author.voice
-        if not voice:
-            await ctx.respond("❌ You aren't in a voice channel!")
-            return
-        
-        self.logger.info(f"🎯 Target channel: {voice.channel.name}")
-        self.logger.info(f"🔗 Attempting connection to {voice.channel.name}")
-        
-        try:
-            # Connect to voice channel with proper parameters
-            vc = await voice.channel.connect(timeout=10.0, reconnect=True)
-            self.connections[ctx.guild.id] = vc
-            self.current_text_channel = ctx.channel
-            
-            self.logger.info(f"✅ Successfully connected to {voice.channel.name}")
-            
-            # Start recording using py-cord's built-in recording
-            vc.start_recording(
-                discord.sinks.WaveSink(),  # Use WaveSink for recording
-                self.recording_finished,   # Callback when recording stops
-                ctx.channel              # Pass channel for responses
-            )
-            
-            self.logger.info(f"🎙️ Recording started in {voice.channel.name}")
-            await ctx.respond(f"🎙️ **Joined {voice.channel.name}** - Recording started!")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Failed to join voice channel: {e}")
-            await ctx.respond(f"❌ Failed to join voice channel: {str(e)}")
-
-    @commands.command(name='leave')
-    async def leave_command(self, ctx):
-        """Stop recording and leave voice channel."""
-        self.logger.info(f"🛑 !leave used by {ctx.author.name}")
-        
-        if ctx.guild.id in self.connections:
-            vc = self.connections[ctx.guild.id]
-            self.logger.info("🛑 Recording stopped")
-            
-            # Stop recording (this will trigger the callback)
-            vc.stop_recording()
-            
-            # Clean up connection
-            del self.connections[ctx.guild.id]
-            await ctx.message.delete()  # Clean up command message
-            
-        else:
-            await ctx.respond("❌ I am currently not recording here.")
+        """Strip <think> tags from text."""
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
 
     @commands.command(name='test')
     async def test_command(self, ctx):
@@ -415,58 +397,47 @@ class DiscordBot(commands.Bot):
             self.logger.error(f"Live commentary failed: {e}")
             await ctx.channel.send(f"❌ Live commentary failed: {str(e)}")
 
-    async def recording_finished(self, sink: discord.sinks.WaveSink, channel: discord.TextChannel, *args):
-        """Callback when recording is finished - processes all recorded audio."""
-        self.logger.info("🎵 Processing recorded audio...")
-        
-        try:
-            # Disconnect from voice
-            await sink.vc.disconnect()
-            self.logger.info("✅ Successfully disconnected from voice")
+    async def recording_finished(self, sink, channel, *args):
+        """Called when recording is finished."""
+        if not HAS_SINKS:
+            self.logger.warning("[DiscordBot] Voice recording not supported (discord.py without py-cord)")
+            return
             
-            # Process each user's audio
-            if sink.audio_data:
-                for user_id, audio in sink.audio_data.items():
+        try:
+            # Get the recorded audio
+            recorded_users = [f"<@{user_id}>" for user_id, audio in sink.audio_data.items()]
+            audio_data = list(sink.audio_data.values())[0] if sink.audio_data else None
+            
+            if audio_data:
+                # Process the audio data
+                self.logger.info(f"[DiscordBot] Recording finished for users: {recorded_users}")
+                
+                # Convert to bytes for processing
+                audio_bytes = audio_data.getvalue()
+                
+                # Process with STT if available
+                if self.stt_service:
                     try:
-                        # Get user info
-                        user = self.get_user(user_id)
-                        user_name = user.display_name if user else f"User_{user_id}"
-                        
-                        # Check if audio file has content
-                        audio_file = audio.file
-                        if os.path.getsize(audio_file.name) > 1024:  # At least 1KB
-                            self.logger.info(f"🎤 Processing audio from {user_name} ({os.path.getsize(audio_file.name)} bytes)")
+                        text = await self.stt_service.transcribe_audio(audio_bytes)
+                        if text and text.strip():
+                            await channel.send(f"🎤 **Transcribed:** {text}")
                             
-                            # Process audio with Whisper
-                            transcription = await self.process_audio_with_whisper(audio_file.name)
-                            
-                            if transcription and transcription.strip():
-                                self.logger.info(f"📝 Transcription from {user_name}: {transcription}")
-                                
-                                # Send transcription to channel
-                                await channel.send(f"🎤 **{user_name}**: {transcription}")
-                                
-                                # Process with LLM if available
-                                if self.llm_service:
-                                    await self.handle_llm_query_and_respond(transcription, user_name, channel)
-                            else:
-                                self.logger.info(f"🔇 No speech detected from {user_name}")
-                        else:
-                            self.logger.info(f"🔇 Audio file too small from {user_name}, skipping")
-                            
-                        # Clean up temporary file
-                        try:
-                            os.unlink(audio_file.name)
-                        except:
-                            pass
-                            
+                            # Process with LLM
+                            if self.llm_service:
+                                response = await self.llm_service.generate_response(text)
+                                if response:
+                                    await channel.send(f"🤖 **DanzarAI:** {response}")
                     except Exception as e:
-                        self.logger.error(f"❌ Error processing audio for user {user_id}: {e}")
+                        self.logger.error(f"[DiscordBot] STT processing error: {e}")
+                        await channel.send("❌ Failed to process audio")
+                else:
+                    await channel.send("🎤 Recording finished (no STT service available)")
             else:
-                self.logger.info("🔇 No audio data recorded")
+                await channel.send("❌ No audio data captured")
                 
         except Exception as e:
-            self.logger.error(f"❌ Error in recording_finished callback: {e}")
+            self.logger.error(f"[DiscordBot] Recording finished error: {e}")
+            await channel.send("❌ Error processing recording")
 
     async def process_audio_with_whisper(self, audio_file_path: str) -> Optional[str]:
         """Process audio file with Whisper STT."""
@@ -1256,82 +1227,6 @@ class DiscordBot(commands.Bot):
             
         except Exception as e:
             self.logger.error(f"[DiscordBot] Error in voice error handler: {e}", exc_info=True)
-
-
-
-    @commands.command(name='leave')
-    async def leave_command(self, ctx):
-        """Leave the current voice channel."""
-        try:
-            if ctx.voice_client:
-                channel_name = ctx.voice_client.channel.name
-                await ctx.voice_client.disconnect()
-                self.voice_client = None
-                self.audio_sink = None
-                await ctx.send(f"✅ Left voice channel: **{channel_name}**")
-                self.logger.info(f"[DiscordBot] Left voice channel: {channel_name}")
-            else:
-                await ctx.send("ℹ️ I'm not in any voice channel!")
-        except Exception as e:
-            self.logger.error(f"Error leaving voice channel: {e}", exc_info=True)
-            await ctx.send("❌ Failed to leave voice channel!")
-
-    @commands.command(name='status')
-    async def status_command(self, ctx):
-        """Show bot status and current voice channel."""
-        try:
-            if ctx.voice_client and ctx.voice_client.channel:
-                channel_name = ctx.voice_client.channel.name
-                member_count = len(ctx.voice_client.channel.members)
-                await ctx.send(f"🎤 **Voice Status:**\n"
-                             f"• Channel: **{channel_name}**\n"
-                             f"• Members: **{member_count}**\n"
-                             f"• Voice processing: **{'Active' if self.audio_sink else 'Inactive'}**")
-            else:
-                await ctx.send("🔇 **Voice Status:** Not connected to any voice channel")
-        except Exception as e:
-            self.logger.error(f"Error getting status: {e}", exc_info=True)
-            await ctx.send("❌ Failed to get status!")
-
-    async def _setup_voice_processing(self, voice_client: discord.VoiceClient):
-        """Setup voice activity detection and audio processing."""
-        try:
-            self.logger.info("[DiscordBot] Setting up voice processing...")
-            
-            # Create audio sink for voice activity detection
-            self.audio_sink = VoiceAudioSink(
-                sample_rate=48000,
-                channels=2,
-                buffer_size=960,
-                vad_threshold=0.3,
-                vad_trigger_level=2,
-                vad_hold_time=0.3
-            )
-            
-            # Set up callbacks
-            self.audio_sink.on_voice_activity = self.on_voice_activity
-            self.audio_sink.on_voice_data = self.on_voice_data
-            self.audio_sink.on_voice_error = self.on_voice_error
-            
-            # Start recording
-            voice_client.start_recording(
-                self.audio_sink,
-                self._after_recording,
-                self._recording_error
-            )
-            
-            self.logger.info("[DiscordBot] Voice processing setup complete")
-            
-        except Exception as e:
-            self.logger.error(f"Error setting up voice processing: {e}", exc_info=True)
-
-    def _after_recording(self, sink, channel, *args):
-        """Called when recording stops."""
-        self.logger.info("[DiscordBot] Recording stopped")
-
-    def _recording_error(self, error):
-        """Called when recording encounters an error."""
-        self.logger.error(f"[DiscordBot] Recording error: {error}")
 
     # Video Analysis Commands
     @commands.command(name='video')

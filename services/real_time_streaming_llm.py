@@ -235,7 +235,15 @@ class RealTimeStreamingLLMService:
                 
                 # Call text callback for Discord display
                 if text_callback and chunk.text.strip():
-                    text_callback(chunk.text)
+                    try:
+                        if asyncio.iscoroutinefunction(text_callback):
+                            # Create a task for async callbacks to avoid blocking
+                            asyncio.create_task(text_callback(chunk.text))
+                        else:
+                            text_callback(chunk.text)
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"[RealTimeStreamingLLM] Text callback error: {e}")
                 
                 # Handle TTS generation - accumulate words into sentences for TTS
                 if tts_callback and chunk.text.strip():
@@ -243,7 +251,8 @@ class RealTimeStreamingLLMService:
                         # Send complete sentence to TTS
                         try:
                             if asyncio.iscoroutinefunction(tts_callback):
-                                await tts_callback(chunk.text)
+                                # Create a task for async callbacks to avoid blocking
+                                asyncio.create_task(tts_callback(chunk.text))
                             else:
                                 tts_callback(chunk.text)
                         except Exception as e:
@@ -256,7 +265,8 @@ class RealTimeStreamingLLMService:
                         if self._is_complete_sentence(accumulated_text):
                             try:
                                 if asyncio.iscoroutinefunction(tts_callback):
-                                    await tts_callback(accumulated_text.strip())
+                                    # Create a task for async callbacks to avoid blocking
+                                    asyncio.create_task(tts_callback(accumulated_text.strip()))
                                 else:
                                     tts_callback(accumulated_text.strip())
                             except Exception as e:
@@ -276,7 +286,8 @@ class RealTimeStreamingLLMService:
             if tts_callback and accumulated_text.strip():
                 try:
                     if asyncio.iscoroutinefunction(tts_callback):
-                        await tts_callback(accumulated_text.strip())
+                        # Create a task for async callbacks to avoid blocking
+                        asyncio.create_task(tts_callback(accumulated_text.strip()))
                     else:
                         tts_callback(accumulated_text.strip())
                 except Exception as e:
@@ -531,16 +542,43 @@ class RealTimeStreamingLLMService:
     
     def _prepare_streaming_messages(self, user_text: str, user_name: str) -> List[Dict[str, str]]:
         """Prepare messages in the format expected by generate_streaming."""
-        # Add streaming-specific instructions
-        system_message = """You are Danzar, an upbeat and witty gaming assistant. 
-        Please respond naturally and conversationally. 
-        Your response will be streamed in real-time, so keep it engaging and clear.
-        Be helpful, friendly, and concise in your responses."""
+        
+        # Get recent conversation context from STM
+        conversation_context = ""
+        if hasattr(self.app_context, 'short_term_memory_service') and self.app_context.short_term_memory_service:
+            try:
+                recent_entries = self.app_context.short_term_memory_service.get_recent_context(user_name, max_entries=5)
+                if recent_entries:
+                    context_parts = []
+                    for entry in recent_entries:
+                        if entry.entry_type == 'user_input':
+                            context_parts.append(f"User: {entry.content}")
+                        elif entry.entry_type == 'bot_response':
+                            context_parts.append(f"Assistant: {entry.content}")
+                    
+                    if context_parts:
+                        conversation_context = "\n".join(context_parts[-8:])  # Last 4 exchanges
+                        if self.logger:
+                            self.logger.debug(f"[RealTimeStreamingLLM] Using conversation context: {len(conversation_context)} chars")
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"[RealTimeStreamingLLM] Failed to get STM context: {e}")
+        
+        # Use profile-based system prompt instead of hardcoded one
+        system_message = self.app_context.active_profile.system_prompt_commentary
         
         messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": f"{user_text}"}
+            {"role": "system", "content": system_message}
         ]
+        
+        # Add conversation context if available
+        if conversation_context:
+            messages.append({
+                "role": "system", 
+                "content": f"Recent conversation context:\n{conversation_context}\n\nRespond naturally, considering the conversation history above."
+            })
+        
+        messages.append({"role": "user", "content": f"{user_text}"})
         
         return messages
     
@@ -649,24 +687,60 @@ class RealTimeStreamingLLMService:
     
     async def add_tts_task(self, text: str, callback: Callable[[bytes], None]):
         """Add a TTS task to the queue."""
-        if not self.enable_tts_streaming:
-            return
-        
         try:
-            self.tts_queue.put_nowait({
+            if not self.enable_tts_streaming:
+                return
+            
+            task = {
                 'text': text,
                 'callback': callback,
-                'timestamp': time.time()
-            })
+                'timestamp': time.time(),
+                'id': f"tts_{int(time.time() * 1000)}"
+            }
+            
+            await self.tts_queue.put(task)
+            
+            if self.logger:
+                self.logger.debug(f"[RealTimeStreamingLLM] Added TTS task: {text[:50]}...")
+                
         except Exception as e:
             if self.logger:
-                self.logger.error(f"[RealTimeStreamingLLM] Failed to add TTS task: {e}")
-    
+                self.logger.error(f"[RealTimeStreamingLLM] Error adding TTS task: {e}")
+
+    async def update_visual_context(self, visual_context: str):
+        """Update the visual context for the VLM with CLIP insights."""
+        try:
+            # Store visual context in app context for the VLM to access
+            if hasattr(self.app_context, 'current_visual_context'):
+                self.app_context.current_visual_context = visual_context
+            else:
+                self.app_context.current_visual_context = visual_context
+            
+            # Also store in a timestamped history
+            if not hasattr(self.app_context, 'visual_context_history'):
+                self.app_context.visual_context_history = []
+            
+            self.app_context.visual_context_history.append({
+                'timestamp': time.time(),
+                'context': visual_context
+            })
+            
+            # Keep only last 10 visual contexts
+            if len(self.app_context.visual_context_history) > 10:
+                self.app_context.visual_context_history = self.app_context.visual_context_history[-10:]
+            
+            if self.logger:
+                self.logger.info(f"[RealTimeStreamingLLM] Updated visual context: {visual_context}")
+                
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[RealTimeStreamingLLM] Error updating visual context: {e}")
+
     def get_status(self) -> Dict[str, Any]:
         """Get service status."""
         return {
             'enabled': self.enable_streaming,
-            'mode': self.stream_mode,
+            'stream_mode': self.stream_mode,
             'active_streams': len(self.active_streams),
             'tts_queue_size': self.tts_queue.qsize(),
             'tts_processing': self.tts_processing
