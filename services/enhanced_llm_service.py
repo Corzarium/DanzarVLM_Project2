@@ -65,10 +65,8 @@ class EnhancedLLMService:
                 self.logger.error("[EnhancedLLMService] Failed to initialize memory manager")
                 return False
             
-            # Initialize model client
-            if not await self.model_client.initialize():
-                self.logger.error("[EnhancedLLMService] Failed to initialize model client")
-                return False
+            # Model client is already initialized when created
+            # No need to call initialize() on it
             
             self.is_initialized = True
             self.logger.info("[EnhancedLLMService] Successfully initialized")

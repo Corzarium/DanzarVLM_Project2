@@ -315,7 +315,6 @@ class VisionAwareConversationService:
         # Get active game profile
         if hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
             context['game_name'] = self.app_context.active_profile.game_name
-            context['game_settings'] = self.app_context.active_profile.settings
         
         # Get recent conversation context
         if self.conversation_history:
@@ -466,137 +465,164 @@ class VisionAwareConversationService:
         try:
             self.logger.info(f"[VisionAwareConversation] 📸 Handling screenshot query: '{message}'")
             
-            # Get vision tools for function calling
+            # Get vision tools for function calling - FIX: Use vision_tools directly
             vision_tools = None
-            langchain_tools = getattr(self.app_context, 'langchain_tools', None)
-            if langchain_tools and hasattr(langchain_tools, 'get_tools_for_llm'):
-                vision_tools = langchain_tools.get_tools_for_llm()
+            if hasattr(self.app_context, 'vision_tools') and self.app_context.vision_tools:
+                vision_tools = self.app_context.vision_tools.get_tools_for_llm()
+                self.logger.info(f"[VisionAwareConversation] 📸 Retrieved {len(vision_tools)} vision tools")
+            else:
+                self.logger.warning("[VisionAwareConversation] ⚠️ No vision_tools available")
             
-            # Create system prompt with tool awareness
-            system_prompt = self.app_context.active_profile.system_prompt_chat
+            # Create enhanced system prompt that forces tool usage
+            system_prompt = self.app_context.active_profile.system_prompt_chat if self.app_context and hasattr(self.app_context, 'active_profile') else "You are DANZAR, a vision-capable gaming assistant with a witty personality."
             
-            # Create messages for the LLM
+            enhanced_system_prompt = f"""{system_prompt}
+
+IMPORTANT: You have VISION CAPABILITIES and can see the user's screen through vision tools.
+When asked about what's on screen, you MUST use the available vision tools to capture and analyze screenshots.
+
+AVAILABLE VISION TOOLS:
+- capture_screenshot: Captures the current screen
+- analyze_screenshot: Analyzes a screenshot and provides detailed description
+- get_vision_summary: Gets a summary of current visual context
+- check_vision_capabilities: Checks if vision tools are working
+
+INSTRUCTIONS:
+1. When asked about the screen, first use capture_screenshot to get the current view
+2. Then use analyze_screenshot to get a detailed description of what you see
+3. Based on the analysis, provide a helpful, enthusiastic response in your DANZAR personality
+4. Reference specific details from the screenshot analysis in your response
+
+DO NOT say you cannot see the screen - you have vision tools available!"""
+
+            # Create messages with proper system/user roles
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"User asks: {message}\n\nPlease use your vision tools to answer this question about what's currently visible on the screen."}
+                {"role": "system", "content": enhanced_system_prompt},
+                {"role": "user", "content": f"User asks: {message}"}
             ]
             
-            # Get conversation context
-            conversation_context = None
-            if self.conversation_memory:
-                conversation_context = self.conversation_memory.get_conversation_context(
-                    user_name=user_name,
-                    include_ltm=True,
-                    max_stm_entries=5,
-                    max_ltm_results=2
-                )
+            # Get model client directly from app context
+            model_client = getattr(self.app_context, 'model_client', None)
+            if not model_client:
+                # Try alternative attribute names
+                model_client = getattr(self.app_context, 'llm_client', None)
+            if not model_client:
+                # Try getting from services
+                model_client = self.app_context.get_service('model_client')
+            if not model_client:
+                self.logger.error("[VisionAwareConversation] ❌ No model client available")
+                return "I'm having trouble connecting to my language model right now."
             
-            if conversation_context:
-                stm_entries = conversation_context.get('stm_entries', [])
-                if stm_entries:
-                    recent_context = []
-                    for entry in stm_entries[-3:]:
-                        if entry.entry_type == 'user_input':
-                            recent_context.append(f"User: {entry.content}")
-                        elif entry.entry_type == 'bot_response':
-                            recent_context.append(f"You: {entry.content}")
-                    
-                    if recent_context:
-                        messages.append({"role": "system", "content": f"Recent conversation context: {' '.join(recent_context)}"})
-            
-            # Call the model with tools
-            if hasattr(self.app_context, 'model_client') and self.app_context.model_client:
-                response = await self.app_context.model_client.generate(
-                    messages=messages,
-                    tools=vision_tools,
-                    temperature=0.7,
-                    max_tokens=512,
-                    model="Qwen2.5-VL-7B-Instruct"
-                )
+            # First attempt: Try with tools if available
+            if vision_tools:
+                self.logger.info(f"[VisionAwareConversation] 🔧 Attempting tool-based response with {len(vision_tools)} tools")
                 
-                # Handle tool calls if the model requests them
-                if isinstance(response, dict) and response.get("type") == "tool_calls":
-                    tool_calls = response.get("tool_calls", [])
-                    self.logger.info(f"[VisionAwareConversation] 🛠️ Processing {len(tool_calls)} tool calls")
-                    
-                    # Execute tool calls
-                    tool_results = []
-                    for tool_call in tool_calls:
-                        function_name = tool_call.get("function", {}).get("name")
-                        arguments = tool_call.get("function", {}).get("arguments", "{}")
-                        
-                        try:
-                            # Parse arguments
-                            import json
-                            args = json.loads(arguments)
-                            
-                            # Execute the tool
-                            if langchain_tools and hasattr(langchain_tools, 'execute_tool'):
-                                result = await langchain_tools.execute_tool(function_name, args)
-                                tool_results.append({
-                                    "tool_call_id": tool_call.get("id"),
-                                    "role": "tool",
-                                    "name": function_name,
-                                    "content": result.result if result.success else f"Error: {result.error_message}"
-                                })
-                                
-                                self.logger.info(f"[VisionAwareConversation] 🛠️ Executed {function_name}: {'✅' if result.success else '❌'}")
-                            
-                        except Exception as e:
-                            self.logger.error(f"[VisionAwareConversation] Tool execution error: {e}")
-                            tool_results.append({
-                                "tool_call_id": tool_call.get("id"),
-                                "role": "tool",
-                                "name": function_name,
-                                "content": f"Error executing tool: {str(e)}"
-                            })
-                    
-                    # Add tool results to messages and get final response
-                    messages.extend(tool_results)
-                    messages.append({"role": "user", "content": "Please provide a comprehensive answer based on the tool results."})
-                    
-                    final_response = await self.app_context.model_client.generate(
+                try:
+                    # Call model with tools
+                    response_data = await model_client.generate(
                         messages=messages,
+                        tools=vision_tools,
                         temperature=0.7,
-                        max_tokens=512,
-                        model="Qwen2.5-VL-7B-Instruct"
+                        max_tokens=512
                     )
                     
-                    if isinstance(final_response, str):
-                        response = final_response
-                    else:
-                        response = "I'm having trouble analyzing the screenshot right now."
-                elif isinstance(response, str):
-                    # Direct response from model
-                    pass
-                else:
-                    response = "I'm having trouble processing your request right now."
-            else:
-                response = "I don't have access to my vision tools right now."
+                    # Check for tool calls in response
+                    if response_data and 'tool_calls' in response_data:
+                        self.logger.info(f"[VisionAwareConversation] 🛠️ Model requested {len(response_data['tool_calls'])} tool calls")
+                        
+                        tool_results = []
+                        for tool_call in response_data['tool_calls']:
+                            tool_name = tool_call.get('function', {}).get('name')
+                            tool_args = tool_call.get('function', {}).get('arguments', '{}')
+                            
+                            if tool_name and hasattr(self.app_context.vision_tools, tool_name):
+                                try:
+                                    # Execute the tool
+                                    if tool_name == 'capture_screenshot':
+                                        result = await self.app_context.vision_tools.capture_screenshot()
+                                    elif tool_name == 'analyze_screenshot':
+                                        result = await self.app_context.vision_tools.analyze_screenshot()
+                                    elif tool_name == 'get_vision_summary':
+                                        result = await self.app_context.vision_tools.get_vision_summary()
+                                    elif tool_name == 'check_vision_capabilities':
+                                        result = await self.app_context.vision_tools.check_vision_capabilities()
+                                    else:
+                                        result = None
+                                    
+                                    if result and result.success:
+                                        tool_results.append({
+                                            "role": "tool",
+                                            "tool_call_id": tool_call.get('id', ''),
+                                            "content": result.data
+                                        })
+                                        self.logger.info(f"[VisionAwareConversation] ✅ Tool {tool_name} executed successfully")
+                                    else:
+                                        self.logger.warning(f"[VisionAwareConversation] ⚠️ Tool {tool_name} failed or returned no data")
+                                        
+                                except Exception as e:
+                                    self.logger.error(f"[VisionAwareConversation] ❌ Error executing tool {tool_name}: {e}")
+                            
+                        # If we got tool results, call model again with results
+                        if tool_results:
+                            messages.extend(tool_results)
+                            messages.append({"role": "user", "content": "Based on the tool results above, provide a comprehensive answer about what you see on the screen. Be enthusiastic and reference specific details from the analysis."})
+                            
+                            final_response = await model_client.generate(
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=512
+                            )
+                            
+                            if final_response and 'content' in final_response:
+                                return final_response['content']
+                    
+                    # If no tool calls or tool execution failed, fall back to direct response
+                    elif response_data and 'content' in response_data:
+                        return response_data['content']
+                        
+                except Exception as e:
+                    self.logger.error(f"[VisionAwareConversation] ❌ Tool-based approach failed: {e}")
             
-            # Store in memory
-            if self.conversation_memory:
-                self.conversation_memory.add_conversation_entry(
-                    user_name=user_name,
-                    content=f"Screenshot query: {message}",
-                    entry_type='user_input',
-                    metadata={'user_id': user_id, 'game_context': game_context, 'query_type': 'screenshot'},
-                    visual_context=None
-                )
-                
-                self.conversation_memory.add_conversation_entry(
-                    user_name=user_name,
-                    content=response,
-                    entry_type='bot_response',
-                    metadata={'user_id': user_id, 'game_context': game_context, 'query_type': 'screenshot'},
-                    visual_context=None
-                )
+            # Fallback: Manual screenshot capture and analysis
+            self.logger.info("[VisionAwareConversation] 🔄 Falling back to manual screenshot capture")
             
-            return response
+            try:
+                # Manually capture and analyze screenshot
+                if hasattr(self.app_context, 'vision_tools') and self.app_context.vision_tools:
+                    screenshot_result = await self.app_context.vision_tools.capture_screenshot()
+                    if screenshot_result and screenshot_result.success:
+                        self.logger.info("[VisionAwareConversation] ✅ Screenshot captured successfully")
+                        
+                        analysis_result = await self.app_context.vision_tools.analyze_screenshot()
+                        if analysis_result and analysis_result.success:
+                            self.logger.info("[VisionAwareConversation] ✅ Screenshot analyzed successfully")
+                            
+                            # Create final message with analysis
+                            final_messages = [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": f"User asks: {message}"},
+                                {"role": "assistant", "content": f"I've analyzed your screen and here's what I see: {analysis_result.data}"},
+                                {"role": "user", "content": "Based on this analysis, provide a helpful and enthusiastic response in your DANZAR personality."}
+                            ]
+                            
+                            final_response = await model_client.generate(
+                                messages=final_messages,
+                                temperature=0.7,
+                                max_tokens=512
+                            )
+                            
+                            if final_response and 'content' in final_response:
+                                return final_response['content']
+            
+            except Exception as e:
+                self.logger.error(f"[VisionAwareConversation] ❌ Manual screenshot approach failed: {e}")
+            
+            # Final fallback: Generic response
+            return "I'm having trouble accessing my vision tools right now, but I'm here to help with anything else!"
             
         except Exception as e:
-            self.logger.error(f"[VisionAwareConversation] Screenshot query error: {e}", exc_info=True)
-            return f"I encountered an error while trying to analyze your screen: {str(e)}"
+            self.logger.error(f"[VisionAwareConversation] ❌ Screenshot query handling failed: {e}")
+            return "I encountered an error while trying to see your screen. Let me know if you need help with anything else!"
     
     async def _generate_enhanced_context_response(self, turn: ConversationTurn, conversation_context: Optional[Dict[str, Any]]) -> str:
         """Generate a response using the LangChain agent for tool awareness."""
@@ -618,7 +644,7 @@ class VisionAwareConversationService:
             
             # Fallback to direct LLM if LangChain not available
             self.logger.warning("[VisionAwareConversation] LangChain agent not available, using direct LLM")
-            return await self._generate_direct_llm_response(turn, conversation_context)
+            return await self._generate_direct_llm_response(turn)
             
         except Exception as e:
             self.logger.error(f"[VisionAwareConversation] Response generation error: {e}")
@@ -664,27 +690,50 @@ class VisionAwareConversationService:
         
         return "\n".join(context_parts) if context_parts else "No additional context available."
     
-    async def _generate_direct_llm_response(self, turn: ConversationTurn, conversation_context: Optional[Dict[str, Any]]) -> str:
-        """Fallback method using direct LLM calls."""
+    async def _generate_direct_llm_response(self, turn: ConversationTurn) -> str:
+        """Generate a direct LLM response using profile-based system prompts."""
         try:
-            # Build the prompt with visual context and conversation memory
-            prompt = self._build_enhanced_visual_aware_prompt(turn)
+            # Get profile-based system prompt
+            system_prompt = "You are DANZAR, a vision-capable gaming assistant with a witty personality."
+            if self.app_context and hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
+                system_prompt = self.app_context.active_profile.system_prompt_chat
             
-            # Get LLM service
-            llm_service = self.app_context.get_service('llm_service')
-            if not llm_service:
-                return "I'm not connected to my language model right now."
+            # Build enhanced prompt with visual context
+            enhanced_prompt = self._build_enhanced_visual_aware_prompt(turn)
             
-            # Generate response using the LLM service
-            response = await llm_service.handle_user_text_query(
-                user_text=prompt,
-                user_name="VisionAwareUser"
+            # Create proper message structure with system role
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": enhanced_prompt}
+            ]
+            
+            # Get model client directly from app context
+            model_client = getattr(self.app_context, 'model_client', None)
+            if not model_client:
+                # Try alternative attribute names
+                model_client = getattr(self.app_context, 'llm_client', None)
+            if not model_client:
+                # Try getting from services
+                model_client = self.app_context.get_service('model_client')
+            if not model_client:
+                self.logger.error("[VisionAwareConversation] ❌ No model client available")
+                return "I'm having trouble connecting to my language model right now."
+            
+            # Generate response using proper message structure
+            response_data = await model_client.generate(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=512
             )
             
-            return response if response else "I'm having trouble thinking about that right now."
-            
+            if response_data and 'content' in response_data:
+                return response_data['content']
+            else:
+                self.logger.error("[VisionAwareConversation] ❌ No content in LLM response")
+                return "I'm having trouble generating a response right now."
+                
         except Exception as e:
-            self.logger.error(f"[VisionAwareConversation] Direct LLM response generation error: {e}")
+            self.logger.error(f"[VisionAwareConversation] ❌ Direct LLM response generation error: {e}")
             return "I'm having trouble thinking about that right now."
     
     def _update_conversation_summary(self, turn: ConversationTurn):
@@ -715,21 +764,43 @@ class VisionAwareConversationService:
     async def _generate_visual_aware_response(self, turn: ConversationTurn) -> str:
         """Generate a response that naturally incorporates visual context and conversation memory."""
         try:
-            # Build the prompt with visual context and conversation memory
-            prompt = self._build_enhanced_visual_aware_prompt(turn)
+            # Get profile-based system prompt
+            system_prompt = "You are DANZAR, a vision-capable gaming assistant with a witty personality."
+            if self.app_context and hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
+                system_prompt = self.app_context.active_profile.system_prompt_chat
             
-            # Get LLM service
-            llm_service = self.app_context.get_service('llm_service')
-            if not llm_service:
+            # Build enhanced prompt with visual context
+            enhanced_prompt = self._build_enhanced_visual_aware_prompt(turn)
+            
+            # Create proper message structure with system role
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": enhanced_prompt}
+            ]
+            
+            # Get model client directly from app context
+            model_client = getattr(self.app_context, 'model_client', None)
+            if not model_client:
+                # Try alternative attribute names
+                model_client = getattr(self.app_context, 'llm_client', None)
+            if not model_client:
+                # Try getting from services
+                model_client = self.app_context.get_service('model_client')
+            if not model_client:
+                self.logger.error("[VisionAwareConversation] ❌ No model client available")
                 return "I'm not connected to my language model right now."
             
-            # Generate response using the LLM service
-            response = await llm_service.handle_user_text_query(
-                user_text=prompt,
-                user_name="VisionAwareUser"
+            # Generate response using proper message structure
+            response_data = await model_client.generate(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=512
             )
             
-            return response if response else "I'm having trouble thinking about that right now."
+            if response_data and 'content' in response_data:
+                return response_data['content']
+            else:
+                return "I'm having trouble thinking about that right now."
             
         except Exception as e:
             self.logger.error(f"[VisionAwareConversation] Response generation error: {e}")
@@ -739,14 +810,10 @@ class VisionAwareConversationService:
         """Build an enhanced prompt that includes visual context and CLIP insights."""
         prompt_parts = []
         
-        # System context
-        system_prompt = self.app_context.active_profile.system_prompt_commentary if self.app_context and hasattr(self.app_context, 'active_profile') else "You are DANZAR, a vision-capable gaming assistant with a witty personality."
-        prompt_parts.append(system_prompt)
-        
         # Visual context
         if turn.visual_context:
             visual = turn.visual_context
-            prompt_parts.append(f"\nCURRENT VISUAL CONTEXT:")
+            prompt_parts.append(f"CURRENT VISUAL CONTEXT:")
             prompt_parts.append(f"- Scene: {visual.scene_summary}")
             prompt_parts.append(f"- Confidence: {visual.confidence:.2f}")
             
@@ -770,13 +837,13 @@ class VisionAwareConversationService:
         
         # Conversation context
         if self.conversation_summary:
-            prompt_parts.append(f"\nCONVERSATION CONTEXT:")
+            prompt_parts.append(f"CONVERSATION CONTEXT:")
             prompt_parts.append(self.conversation_summary)
         
         # Recent conversation history
         recent_turns = list(self.conversation_history)[-3:]  # Last 3 turns
         if recent_turns:
-            prompt_parts.append(f"\nRECENT CONVERSATION:")
+            prompt_parts.append(f"RECENT CONVERSATION:")
             for i, recent_turn in enumerate(recent_turns):
                 if recent_turn != turn:  # Don't include current turn
                     prompt_parts.append(f"- User: {recent_turn.user_input}")
@@ -786,15 +853,15 @@ class VisionAwareConversationService:
         # Game context
         game_context = self._get_game_context()
         if game_context:
-            prompt_parts.append(f"\nGAME CONTEXT:")
+            prompt_parts.append(f"GAME CONTEXT:")
             prompt_parts.append(f"- Game: {game_context.get('game_name', 'Unknown')}")
             prompt_parts.append(f"- Context: {game_context.get('context', 'General gameplay')}")
         
         # User message
-        prompt_parts.append(f"\nUSER MESSAGE: {turn.user_input}")
+        prompt_parts.append(f"USER MESSAGE: {turn.user_input}")
         
         # Instructions
-        prompt_parts.append(f"\nINSTRUCTIONS:")
+        prompt_parts.append(f"INSTRUCTIONS:")
         prompt_parts.append("- Respond naturally and conversationally")
         prompt_parts.append("- Reference what you can see in the game when relevant")
         prompt_parts.append("- Provide helpful gaming advice and commentary")

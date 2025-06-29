@@ -287,7 +287,6 @@ class CentralBrainService:
         # Get active game profile
         if hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
             context['game_name'] = self.app_context.active_profile.game_name
-            context['game_settings'] = self.app_context.active_profile.settings
         
         # Get recent conversation context
         if self.conversation_history:

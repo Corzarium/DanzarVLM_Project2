@@ -87,8 +87,9 @@ class DanzarLangChainTools:
     def _create_vision_tool(self, tool_name: str, description: str) -> BaseTool:
         """Create a LangChain tool wrapper for vision capabilities."""
         
-        @tool(name=tool_name, description=description)
-        async def vision_tool(**kwargs) -> str:
+        @tool
+        async def vision_tool_func(**kwargs) -> str:
+            """Execute vision-related tools for screen capture and analysis."""
             try:
                 if hasattr(self.vision_tools, tool_name):
                     method = getattr(self.vision_tools, tool_name)
@@ -96,52 +97,64 @@ class DanzarLangChainTools:
                         result = await method(**kwargs)
                     else:
                         result = method(**kwargs)
-                    
                     if hasattr(result, 'success') and result.success:
                         return f"✅ {tool_name} completed successfully: {result.data}"
                     else:
-                        error_msg = getattr(result, 'error_message', 'Unknown error')
-                        return f"❌ {tool_name} failed: {error_msg}"
+                        err = getattr(result, 'error', 'Unknown error')
+                        return f"❌ {tool_name} failed: {err}"
                 else:
-                    return f"❌ Tool {tool_name} not available"
+                    return f"❌ Tool '{tool_name}' not found."
             except Exception as e:
-                self.logger.error(f"[LangChainTools] Error in {tool_name}: {e}")
-                return f"❌ Error executing {tool_name}: {str(e)}"
-        
-        return vision_tool
+                return f"❌ Exception in {tool_name}: {e}"
+
+        # Set the tool name and description after function definition
+        vision_tool_func.name = tool_name
+        vision_tool_func.description = description
+        return vision_tool_func
     
     def _create_memory_tool(self, tool_name: str, description: str) -> BaseTool:
         """Create a LangChain tool wrapper for memory capabilities."""
         
-        @tool(name=tool_name, description=description)
-        async def memory_tool(**kwargs) -> str:
+        @tool
+        async def memory_tool_func(**kwargs) -> str:
+            """Execute memory-related tools for searching and storing information."""
             try:
                 if tool_name == "search_memory":
                     query = kwargs.get("query", "")
-                    results = await self.memory_service.search_memories(query, limit=5)
-                    if results:
-                        return f"🔍 Memory search results for '{query}':\n" + "\n".join([f"- {r}" for r in results])
+                    if self.memory_service:
+                        results = await self.memory_service.search_memories(query, limit=5)
+                        if results:
+                            return f"🔍 Memory search results for '{query}':\n" + "\n".join([f"- {r}" for r in results])
+                        else:
+                            return f"🔍 No memories found for '{query}'"
                     else:
-                        return f"🔍 No memories found for '{query}'"
+                        return "❌ Memory service not available"
                 
                 elif tool_name == "store_memory":
                     content = kwargs.get("content", "")
                     importance = kwargs.get("importance", "medium")
-                    await self.memory_service.store_memory(content, importance=importance)
-                    return f"💾 Memory stored successfully: {content[:100]}..."
+                    if self.memory_service:
+                        await self.memory_service.store_memory(content, importance=importance)
+                        return f"💾 Memory stored successfully: {content[:100]}..."
+                    else:
+                        return "❌ Memory service not available"
                 
                 return f"❌ Unknown memory tool: {tool_name}"
             except Exception as e:
                 self.logger.error(f"[LangChainTools] Error in {tool_name}: {e}")
                 return f"❌ Error executing {tool_name}: {str(e)}"
         
-        return memory_tool
+        # Set the tool name and description
+        memory_tool_func.name = tool_name
+        memory_tool_func.description = description
+        return memory_tool_func
     
     def _create_game_context_tool(self, tool_name: str, description: str) -> BaseTool:
         """Create a LangChain tool wrapper for game context capabilities."""
         
-        @tool(name=tool_name, description=description)
-        async def game_context_tool(**kwargs) -> str:
+        @tool
+        async def game_context_tool_func(**kwargs) -> str:
+            """Execute game context tools for managing game profiles and settings."""
             try:
                 if tool_name == "get_game_context":
                     game_profile = getattr(self.app_context, 'active_profile', None)
@@ -155,12 +168,15 @@ class DanzarLangChainTools:
                     if game_type:
                         # Update active profile
                         from core.game_profile import GameProfile
-                        profile = GameProfile.load_profile(game_type, self.app_context)
-                        if profile:
-                            self.app_context.active_profile = profile
-                            return f"🎮 Game context set to: {game_type}"
-                        else:
-                            return f"❌ Unknown game type: {game_type}"
+                        try:
+                            profile = GameProfile.load_profile(game_type, self.app_context)
+                            if profile:
+                                self.app_context.active_profile = profile
+                                return f"🎮 Game context set to: {game_type}"
+                            else:
+                                return f"❌ Unknown game type: {game_type}"
+                        except Exception as e:
+                            return f"❌ Error loading game profile: {str(e)}"
                     else:
                         return "❌ No game type specified"
                 
@@ -169,13 +185,17 @@ class DanzarLangChainTools:
                 self.logger.error(f"[LangChainTools] Error in {tool_name}: {e}")
                 return f"❌ Error executing {tool_name}: {str(e)}"
         
-        return game_context_tool
+        # Set the tool name and description
+        game_context_tool_func.name = tool_name
+        game_context_tool_func.description = description
+        return game_context_tool_func
     
     def _create_system_tool(self, tool_name: str, description: str) -> BaseTool:
         """Create a LangChain tool wrapper for system capabilities."""
         
-        @tool(name=tool_name, description=description)
-        async def system_tool(**kwargs) -> str:
+        @tool
+        async def system_tool_func(**kwargs) -> str:
+            """Execute system-related tools for status checking and conversation history."""
             try:
                 if tool_name == "get_system_status":
                     status = {
@@ -204,7 +224,10 @@ class DanzarLangChainTools:
                 self.logger.error(f"[LangChainTools] Error in {tool_name}: {e}")
                 return f"❌ Error executing {tool_name}: {str(e)}"
         
-        return system_tool
+        # Set the tool name and description
+        system_tool_func.name = tool_name
+        system_tool_func.description = description
+        return system_tool_func
     
     async def initialize_agent(self, model_client) -> bool:
         """Initialize the LangChain agent with the provided model."""
@@ -228,7 +251,6 @@ class DanzarLangChainTools:
                 model_client, 
                 self.tools, 
                 prompt=prompt,
-                checkpointer=memory
             )
             
             # Create agent executor
@@ -303,3 +325,55 @@ class DanzarLangChainTools:
                 results[tool.name] = {"status": "error", "error": str(e)}
         
         return results 
+    
+    async def process_with_vision(self, user_input: str, username: str = "User") -> str:
+        """Process user input with vision-aware capabilities using LangChain tools."""
+        try:
+            self.logger.info(f"[LangChainTools] Processing vision-aware input: '{user_input}'")
+            
+            # Check if we have an agent
+            if not self.agent:
+                self.logger.warning("[LangChainTools] No agent available, falling back to direct LLM")
+                return await self._fallback_direct_llm(user_input, username)
+            
+            # Create a simple prompt for the agent
+            prompt = f"User ({username}): {user_input}\n\nPlease respond naturally and helpfully. If the user asks about seeing their screen or what's visible, use the available vision tools to capture and analyze the screen content."
+            
+            # Run the agent
+            try:
+                result = await self.agent.ainvoke({"input": prompt})
+                response = result.get("output", "")
+                
+                if response:
+                    self.logger.info(f"[LangChainTools] Generated vision-aware response: {len(response)} chars")
+                    return response
+                else:
+                    self.logger.warning("[LangChainTools] Agent returned empty response")
+                    return await self._fallback_direct_llm(user_input, username)
+                    
+            except Exception as e:
+                self.logger.error(f"[LangChainTools] Agent execution error: {e}")
+                return await self._fallback_direct_llm(user_input, username)
+                
+        except Exception as e:
+            self.logger.error(f"[LangChainTools] Vision processing error: {e}")
+            return "I'm having trouble processing your request right now."
+    
+    async def _fallback_direct_llm(self, user_input: str, username: str) -> str:
+        """Fallback to direct LLM processing when agent is not available."""
+        try:
+            # Get model client from app context
+            model_client = getattr(self.app_context, 'model_client', None)
+            if not model_client:
+                return "I'm not connected to my language model right now."
+            
+            # Create a simple prompt
+            prompt = f"User ({username}): {user_input}\n\nPlease respond naturally and helpfully as DANZAR, a gaming assistant."
+            
+            # Get response from model client
+            response = await model_client.generate_response(prompt)
+            return response if response else "I'm having trouble generating a response right now."
+            
+        except Exception as e:
+            self.logger.error(f"[LangChainTools] Fallback LLM error: {e}")
+            return "I'm having trouble connecting to my language model right now." 

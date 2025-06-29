@@ -289,7 +289,22 @@ class AppContext:
 
     def get_service(self, service_name: str):
         """Get a service instance by name."""
-        return getattr(self, f"{service_name}_service", None)
+        # Try the service name as-is first
+        service = getattr(self, service_name, None)
+        if service is not None:
+            return service
+        
+        # Try with _service suffix
+        service = getattr(self, f"{service_name}_service", None)
+        if service is not None:
+            return service
+        
+        # Try with _service prefix
+        service = getattr(self, f"service_{service_name}", None)
+        if service is not None:
+            return service
+        
+        return None
 
     def set_service(self, service_name: str, service_instance):
         """Set a service instance."""
@@ -1767,10 +1782,9 @@ class DanzarVoiceBot(commands.Bot):
             try:
                 from services.streaming_llm_service import StreamingLLMService
                 self.streaming_llm_service = StreamingLLMService(
-                    app_context=self.app_context,
-                    audio_service=None,  # Not needed for voice bot
-                    rag_service=rag_service,    # Use the initialized RAG service
-                    model_client=model_client
+                    self.app_context,
+                    model_client=model_client,
+                    tts_service=self.tts_service
                 )
                 self.app_context.streaming_llm_service = self.streaming_llm_service
                 self.logger.info("✅ Streaming LLM Service initialized")
@@ -1799,7 +1813,7 @@ class DanzarVoiceBot(commands.Bot):
             try:
                 from services.real_time_streaming_llm import RealTimeStreamingLLMService
                 self.real_time_streaming_service = RealTimeStreamingLLMService(
-                    app_context=self.app_context,
+                    self.app_context,
                     model_client=model_client,
                     tts_service=self.tts_service
                 )
@@ -1850,24 +1864,10 @@ class DanzarVoiceBot(commands.Bot):
                 self.app_context.qwen_vision_service = None
 
             # Initialize Vision-Aware Conversation Service with Enhanced Memory
-            try:
-                self.app_context.conversational_ai_service = VisionAwareConversationService(
-                    self.app_context)
-                if await self.app_context.conversational_ai_service.initialize():
-                    self.logger.info(
-                        "✅ Vision-Aware Conversation Service initialized")
-                    self.logger.info(
-                        "🧠 Features: Enhanced STM+LTM memory, visual context, turn-taking")
-                    self.logger.info(
-                        "👁️ Vision-aware responses with CLIP integration")
-                else:
-                    self.logger.error(
-                        "❌ Vision-Aware Conversation Service initialization failed")
-                    self.app_context.conversational_ai_service = None
-            except Exception as e:
-                self.logger.error(
-                    f"❌ Vision-Aware Conversation Service error: {e}")
-                self.app_context.conversational_ai_service = None
+            # REMOVED: This was causing conflicts with Real-Time Streaming LLM Service
+            # Vision capabilities will be implemented as LangChain tools instead
+            self.app_context.conversational_ai_service = None
+            self.logger.info("ℹ️ Vision-Aware Conversation Service disabled - using LangChain tools for vision")
 
             # Store bot reference in app context for services to access Discord
             # methods
@@ -4303,6 +4303,11 @@ class DanzarVoiceBot(commands.Bot):
                             await text_channel.send(f"🎤 **{user_name}**: {transcription}")
                             self.logger.info(f"📤 Sent transcription to Discord: '{transcription}'")
                             
+                            # ===== VISION-AWARE PROCESSING DISABLED =====
+                            # Vision capabilities are now implemented as LangChain tools
+                            # to avoid conflicts with Real-Time Streaming LLM Service
+                            
+                            # ===== PROCESS WITH STREAMING/REGULAR LLM =====
                             # Process with Streaming LLM for real-time responses
                             use_streaming = self.app_context.global_settings.get('STREAMING_RESPONSE', {}).get('enabled', True)
                             
@@ -5077,7 +5082,54 @@ class DanzarVoiceBot(commands.Bot):
     async def _process_transcription(self, transcription: str, user_name: str):
         """Process transcription with enhanced LLM service including STT correction and fact checking"""
         try:
-            # Use enhanced LLM service if available for STT correction and fact checking
+            # PRIORITY 1: Use Real-Time Streaming LLM Service if available (this is working)
+            if (hasattr(self.app_context, 'realtime_voice_service') and 
+                self.app_context.realtime_voice_service):
+                
+                self.logger.info("🎵 Processing with Real-Time Streaming LLM for immediate responses...")
+                
+                # Use the working real-time service's LLM client directly
+                if hasattr(self.app_context.realtime_voice_service, 'llm_client') and self.app_context.realtime_voice_service.llm_client:
+                    try:
+                        # Get current game context
+                        game_context = None
+                        if hasattr(self.app_context, 'active_profile') and self.app_context.active_profile:
+                            game_context = self.app_context.active_profile.game_name
+                        
+                        # Process with the real-time service's LLM client
+                        response = await self.app_context.realtime_voice_service.llm_client.process_user_input(
+                            user_input=transcription,
+                            username=user_name,
+                            game_context=game_context
+                        )
+                        
+                        if response:
+                            # Send response to Discord
+                            text_channel = self.get_configured_text_channel()
+                            if text_channel:
+                                await text_channel.send(f"🤖 **Danzar**: {response}")
+                            
+                            # Generate TTS if available
+                            if hasattr(self, 'tts_service') and self.tts_service:
+                                try:
+                                    tts_audio = self.tts_service.generate_audio(response)
+                                    if tts_audio:
+                                        await self._queue_tts_audio(tts_audio)
+                                        self.logger.info(f"🎵 TTS generated for real-time response ({len(tts_audio)} bytes)")
+                                except Exception as e:
+                                    self.logger.error(f"❌ TTS generation error: {e}")
+                            
+                            return
+                        else:
+                            self.logger.warning("Real-Time Streaming LLM Service returned no response")
+                    except Exception as e:
+                        self.logger.error(f"Real-Time Streaming LLM Service error: {e}")
+                        # Fall back to next priority
+                else:
+                    self.logger.warning("Real-Time Streaming LLM Service has no LLM client")
+                    # Fall back to next priority
+            
+            # PRIORITY 2: Use enhanced LLM service if available for STT correction and fact checking
             if hasattr(self.app_context, 'llm_service') and self.app_context.llm_service:
                 try:
                     # Get current game context
@@ -5114,74 +5166,50 @@ class DanzarVoiceBot(commands.Bot):
                     self.logger.error(f"Enhanced LLM service error: {e}")
                     # Fall back to regular processing
             
-            # Fallback to conversational AI service if enhanced LLM service not available
-            if (hasattr(self.app_context, 'conversational_ai_service') and 
-                self.app_context.conversational_ai_service):
+            # PRIORITY 3: Use LangChain tools for vision-aware processing
+            if (hasattr(self.app_context, 'langchain_tools') and 
+                self.app_context.langchain_tools):
                 
-                service = self.app_context.conversational_ai_service
+                self.logger.info("🤖 Processing with LangChain tools for vision-aware responses...")
                 
-                # Get current game context from video analysis if available
-                game_context = None
-                if hasattr(self.app_context, 'qwen_vl_integration') and self.app_context.qwen_vl_integration:
-                    try:
-                        # Get recent game context from video analysis
-                        game_context = f"Playing {service.current_game}"
-                    except:
-                        pass
-                
-                # Process with conversational AI service
-                response = await service.process_user_message(
-                    user_id="discord_user",  # We don't have user ID in this context
-                    user_name=user_name,
-                    message=transcription,
-                    game_context=game_context
-                )
-                
-                if response:
-                    # Update conversation state
-                    service.conversation_state = service.ConversationState.SPEAKING
+                try:
+                    # Use LangChain agent for vision-aware processing
+                    response = await self.app_context.langchain_tools.process_with_vision(
+                        user_input=transcription,
+                        username=user_name
+                    )
                     
-                    # Send response to Discord
-                    text_channel = self.get_configured_text_channel()
-                    if text_channel:
-                        await text_channel.send(f"🤖 **Danzar**: {response}")
-                    
-                    # Store bot response in memory
-                    if hasattr(self.app_context, 'memory_manager') and self.app_context.memory_manager:
-                        try:
-                            # Add bot response to STM
-                            metadata = {
-                                'user': 'Danzar',
-                                'type': 'bot_response',
-                                'timestamp': datetime.now().isoformat()
-                            }
-                            self.app_context.memory_manager.upsert_stm(response, metadata)
-                            self.logger.info(f"🧠 Stored bot response in memory: '{response[:50]}...'")
-                        except Exception as e:
-                            self.logger.error(f"Memory storage error for bot response: {e}")
-                    
-                    # Generate TTS if available
-                    if hasattr(self, 'tts_service') and self.tts_service:
-                        try:
-                            tts_audio = self.tts_service.generate_audio(response)
-                            if tts_audio:
-                                await self._queue_tts_audio(tts_audio)
-                                self.logger.info(f"🎵 TTS generated for conversational response ({len(tts_audio)} bytes)")
-                        except Exception as e:
-                            self.logger.error(f"❌ TTS generation error: {e}")
-                    
-                    # Reset conversation state after speaking
-                    await asyncio.sleep(1)  # Brief pause
-                    service.conversation_state = service.ConversationState.IDLE
-                else:
-                    self.logger.info(f"⏳ User {user_name} must wait for turn")
+                    if response:
+                        # Send response to Discord
+                        text_channel = self.get_configured_text_channel()
+                        if text_channel:
+                            await text_channel.send(f"🤖 **Danzar**: {response}")
+                        
+                        # Generate TTS if available
+                        if hasattr(self, 'tts_service') and self.tts_service:
+                            try:
+                                tts_audio = self.tts_service.generate_audio(response)
+                                if tts_audio:
+                                    await self._queue_tts_audio(tts_audio)
+                                    self.logger.info(f"🎵 TTS generated for LangChain response ({len(tts_audio)} bytes)")
+                            except Exception as e:
+                                self.logger.error(f"❌ TTS generation error: {e}")
+                        
+                        return
+                    else:
+                        self.logger.warning("LangChain tools returned no response")
+                except Exception as e:
+                    self.logger.error(f"LangChain tools error: {e}")
+                    # Fall back to regular processing
             else:
-                # Fallback to regular processing
-                text_channel = self.get_configured_text_channel()
-                if text_channel:
-                    await self._process_regular_response(transcription, user_name, text_channel)
-                else:
-                    self.logger.warning("No text channel configured for responses")
+                self.logger.warning("LangChain tools not available")
+            
+            # Fallback to regular processing
+            text_channel = self.get_configured_text_channel()
+            if text_channel:
+                await self._process_regular_response(transcription, user_name, text_channel)
+            else:
+                self.logger.warning("No text channel configured for responses")
                 
         except Exception as e:
             self.logger.error(f"❌ Error processing transcription: {e}")
